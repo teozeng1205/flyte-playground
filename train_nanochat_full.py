@@ -303,6 +303,44 @@ def train_nanochat_end_to_end(
         raise RuntimeError(f"Data download failed - cache directory not found")
 
     # ========================================================================
+    # STAGE 2.6: Download evaluation bundle (mirrors speedrun.sh)
+    # ========================================================================
+    print("\n" + "=" * 80)
+    print("STAGE 2.6: FETCHING CORE EVALUATION BUNDLE")
+    print("=" * 80)
+
+    eval_bundle_url = "https://karpathy-public.s3.us-west-2.amazonaws.com/eval_bundle.zip"
+    eval_bundle_dir = os.path.expanduser("~/.cache/nanochat/eval_bundle")
+
+    if os.path.isdir(eval_bundle_dir):
+        print(f"Evaluation bundle already present at {eval_bundle_dir}")
+    else:
+        print("Downloading evaluation bundle (required for CORE metrics)...")
+        import urllib.request
+        import zipfile
+        import io
+        import shutil
+
+        os.makedirs(os.path.dirname(eval_bundle_dir), exist_ok=True)
+        with urllib.request.urlopen(eval_bundle_url) as response:
+            archive_bytes = response.read()
+        print(f"Downloaded {len(archive_bytes) / (1024 * 1024):.2f} MB, extracting...")
+        temp_extract_dir = "/tmp/eval_bundle_extract"
+        if os.path.exists(temp_extract_dir):
+            shutil.rmtree(temp_extract_dir)
+        os.makedirs(temp_extract_dir, exist_ok=True)
+        with zipfile.ZipFile(io.BytesIO(archive_bytes)) as zip_ref:
+            zip_ref.extractall(temp_extract_dir)
+        extracted_path = os.path.join(temp_extract_dir, "eval_bundle")
+        if not os.path.isdir(extracted_path):
+            raise RuntimeError("Expected eval_bundle directory not found in archive")
+        if os.path.exists(eval_bundle_dir):
+            shutil.rmtree(eval_bundle_dir)
+        shutil.move(extracted_path, eval_bundle_dir)
+        shutil.rmtree(temp_extract_dir, ignore_errors=True)
+        print(f"Evaluation bundle available at {eval_bundle_dir}")
+
+    # ========================================================================
     # STAGE 2.5: Build Tokenizer
     # ========================================================================
     print("\n" + "=" * 80)
