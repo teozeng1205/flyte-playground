@@ -1,0 +1,8 @@
+admin:
+  endpoint: dns:///atpco.hosted.unionai.cloud
+image:
+  builder: remote
+task:
+  org: atpco
+  domain: development
+  project: flytesnacks

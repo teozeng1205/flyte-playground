@@ -1,0 +1,15 @@
+.venv/
+__pycache__/
+*.pyc
+wandb_api_key
+.DS_Store
+.pytest_cache/
+.mypy_cache/
+*.log
+*.tmp
+.idea/
+.vscode/
+*.egg-info/
+build/
+dist/
+*.swp
