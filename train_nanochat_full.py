@@ -9,7 +9,6 @@ from datetime import datetime
 # Configure the task environment with GPU and all dependencies
 train_env = flyte.TaskEnvironment(
     name="nanochat-full-training",
-    # Configure for 1 GPU (T4 for cost-effectiveness, can upgrade to A100:1 for speed)
     resources=flyte.Resources(cpu=8, memory="32Gi", gpu=1),
     image=(
         flyte.Image
@@ -375,11 +374,69 @@ def train_nanochat_end_to_end(
         shutil.rmtree(temp_extract_dir, ignore_errors=True)
         print(f"Evaluation bundle available at {eval_bundle_dir}")
 
-    run_stage(
-        "report_reset",
-        "STAGE 2.7: Resetting Nanochat report",
-        [sys.executable, "-m", "nanochat.report", "reset"],
-    )
+    try:
+        run_stage(
+            "report_reset",
+            "STAGE 2.7: Resetting Nanochat report",
+            [sys.executable, "-m", "nanochat.report", "reset"],
+        )
+    except RuntimeError as reset_err:
+        # files-to-prompt sometimes times out in generate_header; fall back to a lightweight header
+        error_msg = str(reset_err)
+        if "report_reset failed" not in error_msg:
+            raise
+        print("Report reset via nanochat.report failed; generating minimal header manually.")
+        try:
+            from nanochat import report as report_mod
+            from nanochat.common import get_base_dir as _get_base_dir
+        except Exception as import_err:
+            raise RuntimeError(f"Unable to import nanochat report module for fallback header: {import_err}") from reset_err
+
+        base_cache_dir = _get_base_dir()
+        report_dir = os.path.join(base_cache_dir, "report")
+        os.makedirs(report_dir, exist_ok=True)
+
+        # Clear expected files and existing report/header if present
+        expected_files = getattr(report_mod, "EXPECTED_FILES", [])
+        for file_name in expected_files:
+            file_path = os.path.join(report_dir, file_name)
+            if os.path.exists(file_path):
+                os.remove(file_path)
+        for filename in ("report.md", "header.md"):
+            path = os.path.join(report_dir, filename)
+            if os.path.exists(path):
+                os.remove(path)
+
+        try:
+            # Try original header generation, but guard against failures
+            header_text = report_mod.generate_header()
+        except Exception as header_err:
+            print(f"Original generate_header failed ({header_err}); writing simplified header.")
+            header_text = (
+                "# nanochat training report\n\n"
+                f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+                "## Environment\n"
+                "- Header generation fallback used (files-to-prompt unavailable or timed out)\n\n"
+                "### Bloat\n"
+                "- Characters: unavailable\n"
+                "- Lines: unavailable\n"
+                "- Files: unavailable\n"
+                "- Tokens (approx): unavailable\n"
+                "- Dependencies (uv.lock lines): unavailable\n\n"
+            )
+
+        header_path = os.path.join(report_dir, "header.md")
+        start_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with open(header_path, "w") as f:
+            f.write(header_text)
+            f.write(f"Run started: {start_time}\n\n---\n\n")
+
+        stage_results["report_reset"] = {
+            "status": "completed_with_fallback",
+            "header_path": header_path,
+            "error": error_msg,
+        }
+        print(f"Fallback report header written to {header_path}")
 
     # ========================================================================
     # STAGE 2.5: Build Tokenizer
