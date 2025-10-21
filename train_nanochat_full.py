@@ -138,6 +138,41 @@ def train_nanochat_end_to_end(
     nanochat_dir = os.getcwd()
     print(f"Working directory: {nanochat_dir}")
 
+    stage_results = {}
+
+    def run_stage(stage_key: str, description: str, command: list[str], extra_env: dict | None = None):
+        """
+        Execute a subprocess command for a given stage, mirroring the sequential workflow in speedrun.sh.
+        """
+        print("\n" + "=" * 80)
+        print(description)
+        print("=" * 80)
+        print("Command:", " ".join(command))
+        sys.stdout.flush()
+
+        cmd_env = os.environ.copy()
+        if extra_env:
+            cmd_env.update(extra_env)
+
+        result = subprocess.run(
+            command,
+            cwd=nanochat_dir,
+            env=cmd_env,
+            text=True,
+        )
+
+        if result.returncode != 0:
+            stage_results[stage_key] = {
+                "status": "failed",
+                "returncode": result.returncode,
+                "command": command,
+            }
+            raise RuntimeError(f"{stage_key} failed with return code {result.returncode}")
+
+        stage_results[stage_key] = {
+            "status": "completed",
+            "command": command,
+        }
     # ========================================================================
     # Install Rust and build rustbpe module
     # ========================================================================
@@ -340,6 +375,12 @@ def train_nanochat_end_to_end(
         shutil.rmtree(temp_extract_dir, ignore_errors=True)
         print(f"Evaluation bundle available at {eval_bundle_dir}")
 
+    run_stage(
+        "report_reset",
+        "STAGE 2.7: Resetting Nanochat report",
+        [sys.executable, "-m", "nanochat.report", "reset"],
+    )
+
     # ========================================================================
     # STAGE 2.5: Build Tokenizer
     # ========================================================================
@@ -425,18 +466,191 @@ def train_nanochat_end_to_end(
     print(f"  https://wandb.ai/wz1492/nanochat/runs/{run_name}")
     print("=" * 80 + "\n")
 
-    # Return results
-    results = {
+    stage_results["base_train"] = {
+        "status": "completed",
+        "command": cmd,
+        "run_name": run_name,
+        "num_iterations": num_iterations,
+        "checkpoint_dir": f"base_checkpoints/d{depth}",
+        "wandb_run": run_name,
+    }
+
+    # STAGE 4: Base loss & sampling
+    base_loss_cmd = [
+        sys.executable,
+        "-m",
+        "scripts.base_loss",
+        "--device_batch_size=8",
+        "--split_tokens=262144",
+    ]
+    run_stage(
+        "base_loss",
+        "STAGE 4: Base loss evaluation & sampling",
+        base_loss_cmd,
+    )
+
+    # STAGE 5: CORE evaluation for base model
+    base_eval_cmd = [sys.executable, "-m", "scripts.base_eval"]
+    run_stage(
+        "base_eval",
+        "STAGE 5: CORE evaluation (base model)",
+        base_eval_cmd,
+    )
+
+    # STAGE 6: Midtraining
+    mid_run_name = f"{run_name}_mid"
+    mid_train_cmd = [
+        sys.executable,
+        "-m",
+        "scripts.mid_train",
+        f"--run={mid_run_name}",
+        "--device_batch_size=8",
+        "--total_batch_size=65536",
+        "--init_lr_frac=0.5",
+        "--eval_every=100",
+    ]
+    run_stage(
+        "mid_train",
+        "STAGE 6: Midtraining (tool use & conversational blend)",
+        mid_train_cmd,
+    )
+    stage_results["mid_train"]["run_name"] = mid_run_name
+
+    # STAGE 7: Chat evaluation for mid model
+    mid_eval_cmd = [
+        sys.executable,
+        "-m",
+        "scripts.chat_eval",
+        "-i",
+        "mid",
+        "-n",
+        "1",
+        "-b",
+        "4",
+        "-m",
+        "256",
+    ]
+    run_stage(
+        "mid_eval",
+        "STAGE 7: Chat evaluation (mid model)",
+        mid_eval_cmd,
+    )
+    stage_results["mid_eval"]["source"] = "mid"
+
+    # STAGE 8: Supervised finetuning (SFT)
+    sft_run_name = f"{run_name}_sft"
+    sft_cmd = [
+        sys.executable,
+        "-m",
+        "scripts.chat_sft",
+        f"--run={sft_run_name}",
+        "--source=mid",
+        "--target_examples_per_step=32",
+        "--eval_every=100",
+        "--eval_steps=100",
+    ]
+    run_stage(
+        "chat_sft",
+        "STAGE 8: Supervised finetuning (SFT)",
+        sft_cmd,
+    )
+    stage_results["chat_sft"]["run_name"] = sft_run_name
+
+    # STAGE 9: Chat evaluation for SFT model
+    sft_eval_cmd = [
+        sys.executable,
+        "-m",
+        "scripts.chat_eval",
+        "-i",
+        "sft",
+        "-n",
+        "1",
+        "-b",
+        "4",
+        "-m",
+        "256",
+    ]
+    run_stage(
+        "sft_eval",
+        "STAGE 9: Chat evaluation (SFT model)",
+        sft_eval_cmd,
+    )
+    stage_results["sft_eval"]["source"] = "sft"
+
+    # STAGE 10: Reinforcement learning on GSM8K
+    rl_run_name = f"{run_name}_rl"
+    rl_cmd = [
+        sys.executable,
+        "-m",
+        "scripts.chat_rl",
+        f"--run={rl_run_name}",
+        "--source=sft",
+        "--examples_per_step=8",
+        "--num_samples=4",
+        "--eval_examples=200",
+        "--save_every=60",
+        "--eval_every=60",
+    ]
+    run_stage(
+        "chat_rl",
+        "STAGE 10: Reinforcement learning (GSM8K)",
+        rl_cmd,
+    )
+    stage_results["chat_rl"]["run_name"] = rl_run_name
+    stage_results["chat_rl"]["source"] = "sft"
+
+    # STAGE 11: Chat evaluation for RL model
+    rl_eval_cmd = [
+        sys.executable,
+        "-m",
+        "scripts.chat_eval",
+        "-i",
+        "rl",
+        "-a",
+        "GSM8K",
+        "-n",
+        "2",
+        "-b",
+        "4",
+        "-m",
+        "256",
+    ]
+    run_stage(
+        "rl_eval",
+        "STAGE 11: Chat evaluation (RL model - GSM8K)",
+        rl_eval_cmd,
+    )
+    stage_results["rl_eval"]["source"] = "rl"
+    stage_results["rl_eval"]["task"] = "GSM8K"
+
+    # STAGE 12: Generate final report
+    run_stage(
+        "report_generate",
+        "STAGE 12: Generating final nanochat report",
+        [sys.executable, "-m", "nanochat.report", "generate"],
+    )
+    base_cache_dir = os.path.expanduser("~/.cache/nanochat")
+    stage_results["report_generate"]["report_path"] = os.path.join(base_cache_dir, "report", "report.md")
+    stage_results["report_generate"]["working_copy"] = os.path.join(nanochat_dir, "report.md")
+
+    final_results = {
         "status": "completed",
         "run_name": run_name,
         "depth": depth,
         "num_iterations": num_iterations,
         "num_data_shards": num_shards,
         "checkpoint_dir": f"base_checkpoints/d{depth}",
+        "wandb": {
+            "base": run_name,
+            "mid": mid_run_name,
+            "sft": sft_run_name,
+            "rl": rl_run_name,
+        },
         "gpu_name": torch.cuda.get_device_name(0) if gpu_available else "None",
+        "stages": stage_results,
     }
 
-    return results
+    return final_results
 
 
 if __name__ == "__main__":
