@@ -195,16 +195,31 @@ for step in range(num_iterations + 1):
     # use the original uncompiled model because the inputs keep changing shape
     if last_step or (step > 0 and step % core_metric_every == 0):
         model.eval()
-        with autocast_ctx:
-            results = evaluate_model(orig_model, tokenizer, device, max_per_task=core_metric_max_per_task)
-        print0(f"Step {step:05d} | CORE metric: {results['core_metric']:.4f}")
-        wandb_run.log({
-            "step": step,
-            "total_training_flops": flops_so_far,
-            "core_metric": results["core_metric"],
-            "centered_results": results["centered_results"],
-        })
-        model.train()
+        try:
+            config_path = os.path.expanduser("~/.cache/nanochat/eval_bundle/core.yaml")
+            if not os.path.exists(config_path):
+                print0(f"Step {step:05d} | CORE metric skipped: missing eval bundle at {config_path}")
+                results = None
+            else:
+                with autocast_ctx:
+                    results = evaluate_model(orig_model, tokenizer, device, max_per_task=core_metric_max_per_task)
+                print0(f"Step {step:05d} | CORE metric: {results['core_metric']:.4f}")
+        except FileNotFoundError as e:
+            print0(f"Step {step:05d} | CORE metric skipped due to missing resources: {e}")
+            results = None
+        except Exception as e:
+            print0(f"Step {step:05d} | CORE metric evaluation failed: {e}")
+            results = None
+        finally:
+            model.train()
+
+        if results is not None:
+            wandb_run.log({
+                "step": step,
+                "total_training_flops": flops_so_far,
+                "core_metric": results["core_metric"],
+                "centered_results": results["centered_results"],
+            })
 
     # once in a while: sample from the model (only on master process)
     # use the original uncompiled model because the inputs keep changing shape
