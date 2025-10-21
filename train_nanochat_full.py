@@ -1,6 +1,6 @@
 """
 Full end-to-end nanochat training workflow with WandB logging.
-This workflow trains a nanochat model on 1 GPU with complete epochs.
+This workflow trains a nanochat model on 2 GPUs with complete epochs.
 """
 
 import flyte
@@ -9,7 +9,7 @@ from datetime import datetime
 # Configure the task environment with GPU and all dependencies
 train_env = flyte.TaskEnvironment(
     name="nanochat-full-training",
-    resources=flyte.Resources(cpu=8, memory="32Gi", gpu=1),
+    resources=flyte.Resources(cpu=16, memory="48Gi", gpu=2),
     image=(
         flyte.Image
         .from_debian_base((3, 12))
@@ -46,8 +46,8 @@ def train_nanochat_end_to_end(
     run_name: str,
     depth: int = 8,
     num_shards: int = 50,
-    num_iterations: int = 1000,  # Reduced for faster iterations
-    device_batch_size: int = 16,
+    num_iterations: int = 2000,  # Slightly longer run for additional capacity
+    device_batch_size: int = 24,
     eval_every: int = 200,
 ) -> dict:
     """
@@ -59,7 +59,7 @@ def train_nanochat_end_to_end(
         run_name: WandB run name
         depth: Model depth (8 = ~42M params)
         num_shards: Number of data shards (50 = ~2.5B tokens)
-        num_iterations: Training iterations (1000 = shorter training)
+        num_iterations: Training iterations (2000 = extended training)
         device_batch_size: Batch size per device
         eval_every: Evaluate every N steps
 
@@ -476,19 +476,28 @@ def train_nanochat_end_to_end(
     print(f"Run name: {run_name}")
     print(f"Depth: {depth}")
     print(f"Iterations: {num_iterations}")
-    print(f"This will take ~1 hour on T4 GPU")
+    print(f"This will take ~2 hours on dual GPUs")
     print("=" * 80 + "\n")
 
     # Prepare training command
     # Note: don't use -- separator, the configurator doesn't expect it
+    world_size = 2
+    seq_len = 512
+    grad_accum_steps = 4
+    total_batch_size = device_batch_size * seq_len * world_size * grad_accum_steps
+
     cmd = [
-        sys.executable, "-m", "scripts.base_train",
+        "torchrun",
+        "--standalone",
+        f"--nproc_per_node={world_size}",
+        "-m",
+        "scripts.base_train",
         f"--run={run_name}",
         f"--depth={depth}",
         f"--num_iterations={num_iterations}",
         f"--device_batch_size={device_batch_size}",
-        f"--total_batch_size=65536",  # Smaller batch for single GPU
-        f"--max_seq_len=512",  # Smaller context for faster training
+        f"--total_batch_size={total_batch_size}",
+        f"--max_seq_len={seq_len}",
         f"--eval_every={eval_every}",
         f"--core_metric_every=2000",  # Evaluate core metrics periodically
         f"--sample_every=500",  # Sample frequently to see progress
@@ -498,7 +507,7 @@ def train_nanochat_end_to_end(
     print(" ".join(cmd))
     print("\n" + "=" * 80)
     print("STARTING TRAINING...")
-    print("This will take ~1 hour. Monitor via WandB!")
+    print("This will take ~2 hours. Monitor via WandB!")
     print("=" * 80 + "\n")
 
     # Run training with real-time output streaming
@@ -530,15 +539,20 @@ def train_nanochat_end_to_end(
         "num_iterations": num_iterations,
         "checkpoint_dir": f"base_checkpoints/d{depth}",
         "wandb_run": run_name,
+        "device_batch_size": device_batch_size,
+        "total_batch_size": total_batch_size,
+        "world_size": world_size,
     }
 
     # STAGE 4: Base loss & sampling
     base_loss_cmd = [
-        sys.executable,
+        "torchrun",
+        "--standalone",
+        f"--nproc_per_node={world_size}",
         "-m",
         "scripts.base_loss",
-        "--device_batch_size=8",
-        "--split_tokens=262144",
+        "--device_batch_size=12",
+        "--split_tokens=393216",
     ]
     run_stage(
         "base_loss",
@@ -547,7 +561,13 @@ def train_nanochat_end_to_end(
     )
 
     # STAGE 5: CORE evaluation for base model
-    base_eval_cmd = [sys.executable, "-m", "scripts.base_eval"]
+    base_eval_cmd = [
+        "torchrun",
+        "--standalone",
+        f"--nproc_per_node={world_size}",
+        "-m",
+        "scripts.base_eval",
+    ]
     run_stage(
         "base_eval",
         "STAGE 5: CORE evaluation (base model)",
@@ -557,14 +577,16 @@ def train_nanochat_end_to_end(
     # STAGE 6: Midtraining
     mid_run_name = f"{run_name}_mid"
     mid_train_cmd = [
-        sys.executable,
+        "torchrun",
+        "--standalone",
+        f"--nproc_per_node={world_size}",
         "-m",
         "scripts.mid_train",
         f"--run={mid_run_name}",
-        "--device_batch_size=8",
-        "--total_batch_size=65536",
-        "--init_lr_frac=0.5",
-        "--eval_every=100",
+        "--device_batch_size=16",
+        "--total_batch_size=131072",
+        "--init_lr_frac=0.6",
+        "--eval_every=80",
     ]
     run_stage(
         "mid_train",
@@ -575,15 +597,17 @@ def train_nanochat_end_to_end(
 
     # STAGE 7: Chat evaluation for mid model
     mid_eval_cmd = [
-        sys.executable,
+        "torchrun",
+        "--standalone",
+        f"--nproc_per_node={world_size}",
         "-m",
         "scripts.chat_eval",
         "-i",
         "mid",
         "-n",
-        "1",
+        "2",
         "-b",
-        "4",
+        "6",
         "-m",
         "256",
     ]
@@ -597,14 +621,16 @@ def train_nanochat_end_to_end(
     # STAGE 8: Supervised finetuning (SFT)
     sft_run_name = f"{run_name}_sft"
     sft_cmd = [
-        sys.executable,
+        "torchrun",
+        "--standalone",
+        f"--nproc_per_node={world_size}",
         "-m",
         "scripts.chat_sft",
         f"--run={sft_run_name}",
         "--source=mid",
-        "--target_examples_per_step=32",
-        "--eval_every=100",
-        "--eval_steps=100",
+        "--target_examples_per_step=48",
+        "--eval_every=80",
+        "--eval_steps=120",
     ]
     run_stage(
         "chat_sft",
@@ -615,15 +641,17 @@ def train_nanochat_end_to_end(
 
     # STAGE 9: Chat evaluation for SFT model
     sft_eval_cmd = [
-        sys.executable,
+        "torchrun",
+        "--standalone",
+        f"--nproc_per_node={world_size}",
         "-m",
         "scripts.chat_eval",
         "-i",
         "sft",
         "-n",
-        "1",
+        "2",
         "-b",
-        "4",
+        "6",
         "-m",
         "256",
     ]
@@ -637,14 +665,16 @@ def train_nanochat_end_to_end(
     # STAGE 10: Reinforcement learning on GSM8K
     rl_run_name = f"{run_name}_rl"
     rl_cmd = [
-        sys.executable,
+        "torchrun",
+        "--standalone",
+        f"--nproc_per_node={world_size}",
         "-m",
         "scripts.chat_rl",
         f"--run={rl_run_name}",
         "--source=sft",
-        "--examples_per_step=8",
-        "--num_samples=4",
-        "--eval_examples=200",
+        "--examples_per_step=12",
+        "--num_samples=6",
+        "--eval_examples=300",
         "--save_every=60",
         "--eval_every=60",
     ]
@@ -658,7 +688,9 @@ def train_nanochat_end_to_end(
 
     # STAGE 11: Chat evaluation for RL model
     rl_eval_cmd = [
-        sys.executable,
+        "torchrun",
+        "--standalone",
+        f"--nproc_per_node={world_size}",
         "-m",
         "scripts.chat_eval",
         "-i",
@@ -666,9 +698,9 @@ def train_nanochat_end_to_end(
         "-a",
         "GSM8K",
         "-n",
-        "2",
+        "3",
         "-b",
-        "4",
+        "6",
         "-m",
         "256",
     ]
@@ -721,15 +753,15 @@ if __name__ == "__main__":
     print("\nThis workflow will:")
     print("  1. Set up environment and verify GPU")
     print("  2. Clone nanochat and download FineWeb-Edu data")
-    print("  3. Train nanochat model for 1000 iterations")
+    print("  3. Train nanochat model for 2000 iterations")
     print("  4. Log all metrics to WandB")
     print("\nConfiguration:")
-    print("  - GPU: 1x T4 (15GB VRAM)")
-    print("  - CPU: 8 cores")
-    print("  - Memory: 32Gi")
+    print("  - GPU: 2x (cluster default)")
+    print("  - CPU: 16 cores")
+    print("  - Memory: 48Gi")
     print("  - Model: 8 layers, ~42M parameters")
     print("  - Data: 50 shards (~2.5B tokens)")
-    print("  - Training: 1000 iterations (~1 hour)")
+    print("  - Training: 2000 iterations (~2 hours)")
     print("  - Logging: WandB (project: nanochat)")
     print("\n" + "=" * 80)
 
@@ -746,9 +778,9 @@ if __name__ == "__main__":
         run_name=run_name,
         depth=8,  # 8 layers = ~42M params (good for T4)
         num_shards=50,  # 50 shards = ~2.5B tokens
-        num_iterations=1000,  # 1000 iterations for shorter training (~1 hour)
-        device_batch_size=16,  # 16 for T4 (adjust based on GPU memory)
-        eval_every=250,  # Evaluate every 250 steps
+        num_iterations=2000,  # 2000 iterations for extended training
+        device_batch_size=24,  # per-device batch size
+        eval_every=200,  # Evaluate every 200 steps
     )
 
     # Print run information
@@ -760,8 +792,8 @@ if __name__ == "__main__":
     print("\nMonitor progress at:")
     print(f"  - Flyte Console: {run.url}")
     print(f"  - WandB: https://wandb.ai/wz1492/nanochat")
-    print("\nEstimated time: ~1-1.5 hours total")
+    print("\nEstimated time: ~2-3 hours total")
     print("  - Data download: ~10 min")
-    print("  - Training (1000 iterations): ~1 hour on T4")
+    print("  - Training (2000 iterations): ~2 hours on dual GPUs")
     print("  - Evaluation: included during training")
     print("=" * 80)
