@@ -33,7 +33,7 @@ train_env = flyte.TaskEnvironment(
         )
     ),
     env_vars={
-        "PYTORCH_ALLOC_CONF": "expandable_segments:true",
+        "PYTORCH_ALLOC_CONF": "expandable_segments:True",
         "PYTHONUNBUFFERED": "1",
     },
     secrets=[flyte.Secret("WANDB_API_KEY")],
