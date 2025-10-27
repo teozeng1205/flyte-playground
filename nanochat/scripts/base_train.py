@@ -9,7 +9,8 @@ torchrun --nproc_per_node=8 base_train.py
 """
 
 import os
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+# Use the modern allocator env var (replaces deprecated PYTORCH_CUDA_ALLOC_CONF)
+os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:true"
 import time
 import wandb
 import torch

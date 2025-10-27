@@ -19,18 +19,20 @@ torchrun --standalone --nproc_per_node=8 -m scripts.chat_rl -- --run=default
 import os
 import itertools
 import re
+import math
 import wandb
 import torch
 import torch.distributed as dist
 
 from nanochat.common import compute_init, compute_cleanup, print0, get_base_dir, DummyWandb
-from nanochat.checkpoint_manager import save_checkpoint, load_model
+from nanochat.checkpoint_manager import save_checkpoint, load_model, find_last_step, find_largest_model
 from nanochat.engine import Engine
 from tasks.gsm8k import GSM8K
 
 # RL hyperparameters
 run = "dummy" # wandb run name
 source = "sft" # mid|sft
+resume = True  # attempt to resume from RL checkpoints if available
 dtype = "bfloat16"
 device_batch_size = 8 # no forward pass will go above this to not OOM
 examples_per_step = 16 # in total and across all ranks (note: examples, not samples/completions!)
@@ -63,8 +65,27 @@ autocast_ctx = torch.amp.autocast(device_type="cuda", dtype=dtype)
 use_dummy_wandb = run == "dummy" or not master_process
 wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(project="nanochat-rl", name=run, config=user_config)
 
-# Init model and tokenizer
-model, tokenizer, meta = load_model(source, device, phase="eval")
+# Init model and tokenizer (with optional resume from prior RL checkpoint)
+start_step = 0
+model = None
+tokenizer = None
+meta = None
+if resume:
+    try:
+        # Try to load the most recent RL checkpoint first
+        model, tokenizer, meta = load_model("rl", device, phase="eval")
+        base_dir = get_base_dir()
+        # Guess model tag based on largest model in rl checkpoints
+        model_tag = find_largest_model(os.path.join(base_dir, "chatrl_checkpoints"))
+        start_step = find_last_step(os.path.join(base_dir, "chatrl_checkpoints", model_tag)) + 1
+        print0(f"Resuming RL training from step {start_step} (tag {model_tag})")
+    except Exception as e:
+        # Fall back to configured source if RL checkpoints not present
+        print0(f"RL resume not available ({e}), loading from source '{source}'")
+        model, tokenizer, meta = load_model(source, device, phase="eval")
+else:
+    model, tokenizer, meta = load_model(source, device, phase="eval")
+
 engine = Engine(model, tokenizer) # for sampling rollouts
 
 # -----------------------------------------------------------------------------
@@ -93,20 +114,35 @@ def get_batch():
         model.eval() # ensure the model is in eval mode
         generated_token_sequences = []
         masks = []
-        num_sampling_steps = num_samples // device_batch_size # go sequentially to prevent OOMs
+        # Use ceil division so we always run at least once, even if num_samples < device_batch_size
+        num_sampling_steps = max(1, math.ceil(num_samples / device_batch_size))
         for sampling_step in range(num_sampling_steps):
+            # Determine how many samples to generate in this pass
+            remaining = max(0, num_samples - sampling_step * device_batch_size)
+            this_batch = device_batch_size if remaining <= 0 else min(device_batch_size, remaining)
+            # If the configured num_samples is 0 (edge case), skip
+            if this_batch <= 0:
+                continue
             seed = hash((step, example_idx, sampling_step)) & 0x7FFFFFFF # positive half of int32
             with autocast_ctx:
                 generated_token_sequences_batch, masks_batch = engine.generate_batch(
                     tokens,
-                    num_samples=device_batch_size,
+                    num_samples=this_batch,
                     max_tokens=max_new_tokens,
                     temperature=temperature,
                     top_k=top_k,
                     seed=seed, # must make sure to change the seed for each sampling step
                 )
+            # Guard against any unexpected empty returns
+            if not generated_token_sequences_batch:
+                continue
             generated_token_sequences.extend(generated_token_sequences_batch)
             masks.extend(masks_batch)
+
+        # If generation produced nothing (e.g., misconfiguration), skip this example to avoid crashing
+        if not generated_token_sequences:
+            print0("Warning: no samples generated for example; skipping")
+            continue
 
         # Calculate the rewards for each sample
         rewards = []
@@ -214,7 +250,7 @@ print0(f"Calculated examples per rank: {examples_per_rank}")
 
 # Kick off the training loop
 batch_iterator = get_batch()
-for step in range(num_steps):
+for step in range(start_step, num_steps):
 
     # Evaluate the model once in a while and log to wandb
     if step % eval_every == 0:
@@ -247,11 +283,12 @@ for step in range(num_steps):
         # Evaluate the loss and gradients
         model.train() # ensure the model is in train mode
         # We need one more loop because we can never exceed the device_batch_size
-        assert inputs_all.size(0) % device_batch_size == 0
-        num_passes = inputs_all.size(0) // device_batch_size
+        B = inputs_all.size(0)
+        num_passes = max(1, math.ceil(B / device_batch_size))
         for pass_idx in range(num_passes):
             # Pluck out the batch for this pass
-            b0, b1 = pass_idx * device_batch_size, (pass_idx + 1) * device_batch_size
+            b0 = pass_idx * device_batch_size
+            b1 = min((pass_idx + 1) * device_batch_size, B)
             inputs = inputs_all[b0:b1]
             targets = targets_all[b0:b1]
             rewards = rewards_all[b0:b1]
@@ -317,6 +354,7 @@ for step in range(num_steps):
             None, # note: we don't bother to save the optimizer state
             {
                 "model_config": model_config_kwargs,
+                "user_config": user_config,
             }
         )
         print(f"✅ Saved model checkpoint to {checkpoint_dir}")

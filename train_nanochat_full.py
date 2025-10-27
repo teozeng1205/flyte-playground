@@ -33,7 +33,7 @@ train_env = flyte.TaskEnvironment(
         )
     ),
     env_vars={
-        "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
+        "PYTORCH_ALLOC_CONF": "expandable_segments:true",
         "PYTHONUNBUFFERED": "1",
     },
     secrets=[flyte.Secret("WANDB_API_KEY")],
@@ -44,9 +44,9 @@ train_env = flyte.TaskEnvironment(
 @train_env.task
 def train_nanochat_end_to_end(
     run_name: str,
-    depth: int = 10,
+    depth: int = 8,
     num_shards: int = 50,
-    num_iterations: int = 2000,  # Reduced for faster iterations
+    num_iterations: int = 5000,  # Reduced for faster iterations
     device_batch_size: int = 16,
     eval_every: int = 200,
 ) -> dict:
@@ -537,7 +537,7 @@ def train_nanochat_end_to_end(
         sys.executable,
         "-m",
         "scripts.base_loss",
-        "--device_batch_size=8",
+        "--device_batch_size=4",  # Reduced from 8 to avoid OOM on T4
         "--split_tokens=262144",
     ]
     run_stage(
@@ -561,8 +561,8 @@ def train_nanochat_end_to_end(
         "-m",
         "scripts.mid_train",
         f"--run={mid_run_name}",
-        "--device_batch_size=8",
-        "--total_batch_size=65536",
+        "--device_batch_size=4",  # Reduced from 8 to avoid OOM on T4
+        "--total_batch_size=32768",  # Reduced proportionally to maintain gradient accumulation
         "--init_lr_frac=0.5",
         "--eval_every=100",
     ]
@@ -642,6 +642,7 @@ def train_nanochat_end_to_end(
         "scripts.chat_rl",
         f"--run={rl_run_name}",
         "--source=sft",
+        "--resume=True",
         "--examples_per_step=8",
         "--num_samples=4",
         "--eval_examples=200",
@@ -711,13 +712,25 @@ def train_nanochat_end_to_end(
 
 
 if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Submit nanochat end-to-end training to Flyte")
+    parser.add_argument("--run_name", type=str, default=None, help="W&B run name / job name prefix")
+    parser.add_argument("--depth", type=int, default=4, help="Model depth (smaller = faster). Default: 4")
+    parser.add_argument("--num_shards", type=int, default=5, help="Number of dataset shards to download. Default: 5")
+    parser.add_argument("--num_iterations", type=int, default=500, help="Base training iterations. Default: 500")
+    parser.add_argument("--device_batch_size", type=int, default=8, help="Per-device batch size. Default: 8")
+    parser.add_argument("--eval_every", type=int, default=100, help="Evaluate every N steps. Default: 100")
+
+    args = parser.parse_args()
+
     # Initialize Flyte connection
     print("Initializing Flyte connection...")
     flyte.init_from_config(".flyte/config.yaml")
 
     # Generate unique run name
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    run_name = f"nanochat_d10_5k_flyte_{timestamp}"
+    run_name = args.run_name or f"nanochat_smoke_d{args.depth}_{args.num_iterations}_{timestamp}"
     print(f"\nRun name: {run_name}")
     print("Submitting workflow...\n")
 
@@ -725,9 +738,9 @@ if __name__ == "__main__":
     run = flyte.run(
         train_nanochat_end_to_end,
         run_name=run_name,
-        depth=10,  # 10 layers = larger model
-        num_shards=50,  # 50 shards = ~2.5B tokens
-        num_iterations=2000,  # 2000 iterations for longer training (~2 hours)
-        device_batch_size=16,  # 16 for T4 (adjust based on GPU memory)
-        eval_every=250,  # Evaluate every 250 steps
+        depth=args.depth,
+        num_shards=args.num_shards,
+        num_iterations=args.num_iterations,
+        device_batch_size=args.device_batch_size,
+        eval_every=args.eval_every,
     )
