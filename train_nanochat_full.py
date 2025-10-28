@@ -4,6 +4,7 @@ This workflow trains a nanochat model on 1 GPU with complete epochs.
 """
 
 import re
+from enum import StrEnum
 import flyte
 from datetime import datetime
 
@@ -40,6 +41,14 @@ train_env = flyte.TaskEnvironment(
     secrets=[flyte.Secret("WANDB_API_KEY")],
     cache=flyte.Cache("auto"),
 )
+
+class TrainingStage(StrEnum):
+    CHAT_RL = "chat_rl"
+    CHAT_SFT = "chat_sft"
+    MID_TRAIN = "mid_train"
+    BASE_TRAIN = "base_train"
+
+ARTIFACT_PROJECT = "nanochat"
 
 
 @train_env.task
@@ -773,16 +782,16 @@ def train_nanochat_end_to_end(
         except Exception as exc:  # pragma: no cover - defensive guard
             print(f"Skipping model artifact upload: wandb unavailable ({exc}).")
         else:
-            def stage_completed(key: str) -> bool:
-                return stage_results.get(key, {}).get("status") == "completed"
+            def stage_completed(stage: TrainingStage) -> bool:
+                return stage_results.get(stage.value, {}).get("status") == "completed"
 
-            checkpoint_candidates = [
-                ("chat_rl", "chatrl_checkpoints", rl_run_name, "nanochat-rl"),
-                ("chat_sft", "chatsft_checkpoints", sft_run_name, "nanochat-sft"),
-                ("mid_train", "mid_checkpoints", mid_run_name, "nanochat-mid"),
-                ("base_train", "base_checkpoints", run_name, "nanochat"),
+            checkpoint_candidates: list[tuple[TrainingStage, str, str]] = [
+                (TrainingStage.CHAT_RL, "chatrl_checkpoints", rl_run_name),
+                (TrainingStage.CHAT_SFT, "chatsft_checkpoints", sft_run_name),
+                (TrainingStage.MID_TRAIN, "mid_checkpoints", mid_run_name),
+                (TrainingStage.BASE_TRAIN, "base_checkpoints", run_name),
             ]
-            for stage_key, checkpoint_root, target_run, project in checkpoint_candidates:
+            for stage_key, checkpoint_root, target_run in checkpoint_candidates:
                 if not stage_completed(stage_key):
                     continue
                 root_dir = os.path.join(base_cache_dir, checkpoint_root)
@@ -791,12 +800,11 @@ def train_nanochat_end_to_end(
                     checkpoint_dir = os.path.join(root_dir, model_tag)
                     step = find_last_step(checkpoint_dir)
                 except Exception as exc:
-                    print(f"Skipping {stage_key} checkpoint upload: {exc}")
+                    print(f"Skipping {stage_key.value} checkpoint upload: {exc}")
                     continue
 
                 artifact_details = {
                     "stage": stage_key,
-                    "project": project,
                     "run_name": target_run,
                     "model_tag": model_tag,
                     "checkpoint_dir": checkpoint_dir,
@@ -809,20 +817,21 @@ def train_nanochat_end_to_end(
                     sanitized = re.sub(r"[^A-Za-z0-9._-]+", "-", value.strip())
                     return sanitized.strip("-") or "model"
 
-                artifact_name = _slugify(f"{artifact_details['run_name']}-{artifact_details['stage']}-ckpt")
+                stage_key = artifact_details["stage"]
+                artifact_name = _slugify(f"{stage_key.value}-{artifact_details['run_name']}-ckpt")
                 artifact_type = "model"
                 artifact_dir = artifact_details["checkpoint_dir"]
                 print(f"Uploading checkpoint directory {artifact_dir} to WandB artifact '{artifact_name}'")
                 wandb_run = None
                 try:
                     wandb_run = wandb.init(
-                        project=artifact_details["project"],
-                        name=f"{artifact_details['run_name']}-artifact-upload",
+                        project=ARTIFACT_PROJECT,
+                        name=_slugify(f"upload-{stage_key.value}-{artifact_details['run_name']}"),
                         job_type="model-upload",
                         reinit=True,
                     )
                     artifact = wandb.Artifact(name=artifact_name, type=artifact_type, metadata={
-                        "stage": artifact_details["stage"],
+                        "stage": stage_key.value,
                         "model_tag": artifact_details["model_tag"],
                         "step": artifact_details["step"],
                     })
@@ -832,9 +841,10 @@ def train_nanochat_end_to_end(
                     stage_results["model_artifact"] = {
                         "status": "uploaded",
                         "artifact_name": artifact_name,
-                        "project": artifact_details["project"],
+                        "project": ARTIFACT_PROJECT,
                         "checkpoint_dir": artifact_dir,
                         "step": artifact_details["step"],
+                        "stage": stage_key.value,
                     }
                     print(f"WandB artifact '{artifact_name}' uploaded successfully.")
                 except Exception as exc:  # pragma: no cover - runtime failure guard
@@ -842,6 +852,7 @@ def train_nanochat_end_to_end(
                         wandb_run.finish()
                     stage_results["model_artifact"] = {
                         "status": "failed",
+                        "stage": stage_key.value,
                         "error": str(exc),
                     }
                     print(f"Failed to upload WandB artifact: {exc}")
