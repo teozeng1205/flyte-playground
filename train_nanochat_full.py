@@ -708,13 +708,14 @@ def train_nanochat_end_to_end(
         "scripts.chat_rl",
         f"--run={rl_run_name}",
         "--source=sft",
-        f"--resume={rl_resume}",
         f"--examples_per_step={rl_examples_per_step}",
         f"--num_samples={rl_num_samples}",
         f"--eval_examples={rl_eval_examples}",
         f"--save_every={rl_save_every}",
         f"--eval_every={rl_eval_every}",
     ]
+    if not rl_resume:
+        rl_cmd.append("--resume=False")
     run_stage(
         "chat_rl",
         "STAGE 10: Reinforcement learning (GSM8K)",
