@@ -149,10 +149,33 @@ def reliability_guard(maximum_memory_bytes: Optional[int] = None):
     if maximum_memory_bytes is not None:
         import resource
 
-        resource.setrlimit(resource.RLIMIT_AS, (maximum_memory_bytes, maximum_memory_bytes))
-        resource.setrlimit(resource.RLIMIT_DATA, (maximum_memory_bytes, maximum_memory_bytes))
-        if not platform.uname().system == "Darwin":
-            resource.setrlimit(resource.RLIMIT_STACK, (maximum_memory_bytes, maximum_memory_bytes))
+        def _clamp_limit(limit_type: int, target: int) -> None:
+            """Clamp soft/hard limits down to target without attempting to raise caps."""
+            soft, hard = resource.getrlimit(limit_type)
+
+            def _desired(current: int) -> int:
+                if current == resource.RLIM_INFINITY:
+                    return target
+                return min(current, target)
+
+            new_hard = _desired(hard)
+            new_soft = _desired(soft)
+            if new_soft > new_hard:
+                new_soft = new_hard
+            try:
+                resource.setrlimit(limit_type, (new_soft, new_hard))
+            except ValueError:
+                # Some platforms disallow reducing the hard limit; fall back to keeping it.
+                try:
+                    resource.setrlimit(limit_type, (new_soft, hard))
+                except ValueError:
+                    # Nothing else we can do; leave the original limits in place.
+                    pass
+
+        _clamp_limit(resource.RLIMIT_AS, maximum_memory_bytes)
+        _clamp_limit(resource.RLIMIT_DATA, maximum_memory_bytes)
+        if platform.uname().system != "Darwin":
+            _clamp_limit(resource.RLIMIT_STACK, maximum_memory_bytes)
 
     faulthandler.disable()
 
@@ -347,4 +370,3 @@ def execute_code(
         timeout=result_dict["timeout"],
         memory_exceeded=result_dict["memory_exceeded"],
     )
-
