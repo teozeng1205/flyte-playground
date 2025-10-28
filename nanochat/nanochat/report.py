@@ -162,10 +162,13 @@ Generated: {timestamp}
 
     # bloat metrics: package all of the source code and assess its weight
     packaged = run_command('files-to-prompt . -e py -e md -e rs -e html -e toml -e sh --ignore "*target*" --cxml')
-    num_chars = len(packaged)
-    num_lines = len(packaged.split('\n'))
-    num_files = len([x for x in packaged.split('\n') if x.startswith('<source>')])
-    num_tokens = num_chars // 4 # assume approximately 4 chars per token
+    if packaged:
+        num_chars = len(packaged)
+        num_lines = len(packaged.split('\n'))
+        num_files = len([x for x in packaged.split('\n') if x.startswith('<source>')])
+        num_tokens = num_chars // 4 # assume approximately 4 chars per token
+    else:
+        num_chars = num_lines = num_files = num_tokens = None
 
     # count dependencies via uv.lock
     uv_lock_lines = 0
@@ -173,12 +176,20 @@ Generated: {timestamp}
         with open('uv.lock', 'r') as f:
             uv_lock_lines = len(f.readlines())
 
-    header += f"""
-### Bloat
-- Characters: {num_chars:,}
+    if packaged:
+        bloat_block = f"""- Characters: {num_chars:,}
 - Lines: {num_lines:,}
 - Files: {num_files:,}
-- Tokens (approx): {num_tokens:,}
+- Tokens (approx): {num_tokens:,}"""
+    else:
+        bloat_block = """- Characters: unavailable
+- Lines: unavailable
+- Files: unavailable
+- Tokens (approx): unavailable"""
+
+    header += f"""
+### Bloat
+{bloat_block}
 - Dependencies (uv.lock lines): {uv_lock_lines:,}
 
 """
