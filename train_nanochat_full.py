@@ -49,6 +49,37 @@ def train_nanochat_end_to_end(
     num_iterations: int = 5000,  # Reduced for faster iterations
     device_batch_size: int = 16,
     eval_every: int = 200,
+    base_total_batch_size: int = 65536,
+    base_max_seq_len: int = 512,
+    base_core_metric_every: int = 2000,
+    base_sample_every: int = 500,
+    base_loss_device_batch_size: int = 4,
+    base_loss_split_tokens: int = 262144,
+    mid_device_batch_size: int = 4,
+    mid_total_batch_size: int = 32768,
+    mid_init_lr_frac: float = 0.5,
+    mid_eval_every: int = 100,
+    mid_eval_num_samples: int = 1,
+    mid_eval_batch_size: int = 4,
+    mid_eval_max_new_tokens: int = 256,
+    mid_eval_task: str | None = None,
+    sft_target_examples_per_step: int = 32,
+    sft_eval_every: int = 100,
+    sft_eval_steps: int = 100,
+    sft_eval_num_samples: int = 1,
+    sft_eval_batch_size: int = 4,
+    sft_eval_max_new_tokens: int = 256,
+    sft_eval_task: str | None = None,
+    rl_examples_per_step: int = 8,
+    rl_num_samples: int = 4,
+    rl_eval_examples: int = 200,
+    rl_save_every: int = 60,
+    rl_eval_every: int = 60,
+    rl_resume: bool = True,
+    rl_eval_num_samples: int = 2,
+    rl_eval_batch_size: int = 4,
+    rl_eval_max_new_tokens: int = 256,
+    rl_eval_task: str = "GSM8K",
 ) -> dict:
     """
     Complete end-to-end training: download data, train model, log to WandB.
@@ -62,6 +93,37 @@ def train_nanochat_end_to_end(
         num_iterations: Training iterations (1000 = shorter training)
         device_batch_size: Batch size per device
         eval_every: Evaluate every N steps
+        base_total_batch_size: Total tokens per optimizer step during base training
+        base_max_seq_len: Context length used for base training
+        base_core_metric_every: Frequency (steps) for CORE metric evaluation during base training
+        base_sample_every: Sampling frequency (steps) during base training
+        base_loss_device_batch_size: Per-device batch size for loss evaluation
+        base_loss_split_tokens: Tokens per split when computing base loss
+        mid_device_batch_size: Per-device batch size for mid-training
+        mid_total_batch_size: Total tokens per optimizer step during mid-training
+        mid_init_lr_frac: Mid-training initial LR multiplier
+        mid_eval_every: Evaluation cadence (steps) during mid-training
+        mid_eval_num_samples: Samples per prompt for mid-stage chat evaluation
+        mid_eval_batch_size: Batch size for categorical mid-stage evaluation
+        mid_eval_max_new_tokens: Max generated tokens for mid-stage chat evaluation
+        mid_eval_task: Optional task list override for mid-stage chat evaluation
+        sft_target_examples_per_step: Target examples per step during SFT
+        sft_eval_every: Evaluation cadence (steps) during SFT
+        sft_eval_steps: Number of evaluation steps during SFT
+        sft_eval_num_samples: Samples per prompt for SFT chat evaluation
+        sft_eval_batch_size: Batch size for categorical SFT evaluation
+        sft_eval_max_new_tokens: Max generated tokens for SFT chat evaluation
+        sft_eval_task: Optional task list override for SFT chat evaluation
+        rl_examples_per_step: GSM8K examples per RL optimization step
+        rl_num_samples: Samples to draw per RL prompt
+        rl_eval_examples: GSM8K examples used during RL evaluation
+        rl_save_every: Checkpoint save cadence (minutes) during RL
+        rl_eval_every: Evaluation cadence (minutes) during RL
+        rl_resume: Whether to resume RL from latest checkpoint
+        rl_eval_num_samples: Samples per prompt for RL chat evaluation
+        rl_eval_batch_size: Batch size for categorical RL evaluation
+        rl_eval_max_new_tokens: Max generated tokens for RL chat evaluation
+        rl_eval_task: Task name used for RL chat evaluation
 
     Returns:
         Training results and metrics
@@ -487,11 +549,11 @@ def train_nanochat_end_to_end(
         f"--depth={depth}",
         f"--num_iterations={num_iterations}",
         f"--device_batch_size={device_batch_size}",
-        f"--total_batch_size=65536",  # Smaller batch for single GPU
-        f"--max_seq_len=512",  # Smaller context for faster training
+        f"--total_batch_size={base_total_batch_size}",  # Smaller batch for single GPU
+        f"--max_seq_len={base_max_seq_len}",  # Smaller context for faster training
         f"--eval_every={eval_every}",
-        f"--core_metric_every=2000",  # Evaluate core metrics periodically
-        f"--sample_every=500",  # Sample frequently to see progress
+        f"--core_metric_every={base_core_metric_every}",  # Evaluate core metrics periodically
+        f"--sample_every={base_sample_every}",  # Sample frequently to see progress
     ]
 
     print("Training command:")
@@ -537,8 +599,8 @@ def train_nanochat_end_to_end(
         sys.executable,
         "-m",
         "scripts.base_loss",
-        "--device_batch_size=4",  # Reduced from 8 to avoid OOM on T4
-        "--split_tokens=262144",
+        f"--device_batch_size={base_loss_device_batch_size}",  # Reduced from 8 to avoid OOM on T4
+        f"--split_tokens={base_loss_split_tokens}",
     ]
     run_stage(
         "base_loss",
@@ -561,10 +623,10 @@ def train_nanochat_end_to_end(
         "-m",
         "scripts.mid_train",
         f"--run={mid_run_name}",
-        "--device_batch_size=4",  # Reduced from 8 to avoid OOM on T4
-        "--total_batch_size=32768",  # Reduced proportionally to maintain gradient accumulation
-        "--init_lr_frac=0.5",
-        "--eval_every=100",
+        f"--device_batch_size={mid_device_batch_size}",  # Reduced from 8 to avoid OOM on T4
+        f"--total_batch_size={mid_total_batch_size}",  # Reduced proportionally to maintain gradient accumulation
+        f"--init_lr_frac={mid_init_lr_frac}",
+        f"--eval_every={mid_eval_every}",
     ]
     run_stage(
         "mid_train",
@@ -581,12 +643,14 @@ def train_nanochat_end_to_end(
         "-i",
         "mid",
         "-n",
-        "1",
+        str(mid_eval_num_samples),
         "-b",
-        "4",
+        str(mid_eval_batch_size),
         "-m",
-        "256",
+        str(mid_eval_max_new_tokens),
     ]
+    if mid_eval_task:
+        mid_eval_cmd.extend(["-a", mid_eval_task])
     run_stage(
         "mid_eval",
         "STAGE 7: Chat evaluation (mid model)",
@@ -602,9 +666,9 @@ def train_nanochat_end_to_end(
         "scripts.chat_sft",
         f"--run={sft_run_name}",
         "--source=mid",
-        "--target_examples_per_step=32",
-        "--eval_every=100",
-        "--eval_steps=100",
+        f"--target_examples_per_step={sft_target_examples_per_step}",
+        f"--eval_every={sft_eval_every}",
+        f"--eval_steps={sft_eval_steps}",
     ]
     run_stage(
         "chat_sft",
@@ -621,12 +685,14 @@ def train_nanochat_end_to_end(
         "-i",
         "sft",
         "-n",
-        "1",
+        str(sft_eval_num_samples),
         "-b",
-        "4",
+        str(sft_eval_batch_size),
         "-m",
-        "256",
+        str(sft_eval_max_new_tokens),
     ]
+    if sft_eval_task:
+        sft_eval_cmd.extend(["-a", sft_eval_task])
     run_stage(
         "sft_eval",
         "STAGE 9: Chat evaluation (SFT model)",
@@ -642,12 +708,12 @@ def train_nanochat_end_to_end(
         "scripts.chat_rl",
         f"--run={rl_run_name}",
         "--source=sft",
-        "--resume=True",
-        "--examples_per_step=8",
-        "--num_samples=4",
-        "--eval_examples=200",
-        "--save_every=60",
-        "--eval_every=60",
+        f"--resume={rl_resume}",
+        f"--examples_per_step={rl_examples_per_step}",
+        f"--num_samples={rl_num_samples}",
+        f"--eval_examples={rl_eval_examples}",
+        f"--save_every={rl_save_every}",
+        f"--eval_every={rl_eval_every}",
     ]
     run_stage(
         "chat_rl",
@@ -664,22 +730,22 @@ def train_nanochat_end_to_end(
         "scripts.chat_eval",
         "-i",
         "rl",
-        "-a",
-        "GSM8K",
         "-n",
-        "2",
+        str(rl_eval_num_samples),
         "-b",
-        "4",
+        str(rl_eval_batch_size),
         "-m",
-        "256",
+        str(rl_eval_max_new_tokens),
     ]
+    if rl_eval_task:
+        rl_eval_cmd.extend(["-a", rl_eval_task])
     run_stage(
         "rl_eval",
         "STAGE 11: Chat evaluation (RL model - GSM8K)",
         rl_eval_cmd,
     )
     stage_results["rl_eval"]["source"] = "rl"
-    stage_results["rl_eval"]["task"] = "GSM8K"
+    stage_results["rl_eval"]["task"] = rl_eval_task or "all"
 
     # STAGE 12: Generate final report
     run_stage(
@@ -722,6 +788,45 @@ if __name__ == "__main__":
     parser.add_argument("--device_batch_size", type=int, default=8, help="Per-device batch size. Default: 8")
     parser.add_argument("--eval_every", type=int, default=100, help="Evaluate every N steps. Default: 100")
 
+    base_group = parser.add_argument_group("base training", "Parameters for base training and loss evaluation")
+    base_group.add_argument("--base-total-batch-size", type=int, default=65536, help="Total batch size (tokens) for base training.")
+    base_group.add_argument("--base-max-seq-len", type=int, default=512, help="Max sequence length used for base training.")
+    base_group.add_argument("--base-core-metric-every", type=int, default=2000, help="Frequency (steps) for CORE metric evaluation during base training.")
+    base_group.add_argument("--base-sample-every", type=int, default=500, help="Frequency (steps) for sampling during base training.")
+    base_group.add_argument("--base-loss-device-batch-size", type=int, default=4, help="Per-device batch size for base loss evaluation.")
+    base_group.add_argument("--base-loss-split-tokens", type=int, default=262144, help="Tokens per split for base loss evaluation.")
+
+    mid_group = parser.add_argument_group("mid training", "Parameters for the mid-training stage and evaluation")
+    mid_group.add_argument("--mid-device-batch-size", type=int, default=4, help="Per-device batch size for mid training.")
+    mid_group.add_argument("--mid-total-batch-size", type=int, default=32768, help="Total batch size (tokens) for mid training.")
+    mid_group.add_argument("--mid-init-lr-frac", type=float, default=0.5, help="Initial learning rate fraction for mid training.")
+    mid_group.add_argument("--mid-eval-every", type=int, default=100, help="Evaluation cadence (steps) during mid training.")
+    mid_group.add_argument("--mid-eval-num-samples", type=int, default=1, help="Samples per prompt for mid-stage chat evaluation.")
+    mid_group.add_argument("--mid-eval-batch-size", type=int, default=4, help="Batch size for categorical mid-stage evaluation.")
+    mid_group.add_argument("--mid-eval-max-new-tokens", type=int, default=256, help="Max new tokens for mid-stage chat evaluation.")
+    mid_group.add_argument("--mid-eval-task", type=str, default=None, help="Optional override for mid-stage evaluation task list.")
+
+    sft_group = parser.add_argument_group("sft training", "Parameters for SFT training and evaluation")
+    sft_group.add_argument("--sft-target-examples-per-step", type=int, default=32, help="Target examples per optimizer step during SFT.")
+    sft_group.add_argument("--sft-eval-every", type=int, default=100, help="Evaluation cadence (steps) during SFT.")
+    sft_group.add_argument("--sft-eval-steps", type=int, default=100, help="Number of evaluation steps during SFT.")
+    sft_group.add_argument("--sft-eval-num-samples", type=int, default=1, help="Samples per prompt for SFT chat evaluation.")
+    sft_group.add_argument("--sft-eval-batch-size", type=int, default=4, help="Batch size for categorical SFT evaluation.")
+    sft_group.add_argument("--sft-eval-max-new-tokens", type=int, default=256, help="Max new tokens for SFT chat evaluation.")
+    sft_group.add_argument("--sft-eval-task", type=str, default=None, help="Optional override for SFT evaluation task list.")
+
+    rl_group = parser.add_argument_group("rl stage", "Parameters for RL training and evaluation")
+    rl_group.add_argument("--rl-examples-per-step", type=int, default=8, help="Examples per optimization step during RL.")
+    rl_group.add_argument("--rl-num-samples", type=int, default=4, help="Samples per prompt during RL training.")
+    rl_group.add_argument("--rl-eval-examples", type=int, default=200, help="Examples evaluated during RL.")
+    rl_group.add_argument("--rl-save-every", type=int, default=60, help="Minutes between RL checkpoints.")
+    rl_group.add_argument("--rl-eval-every", type=int, default=60, help="Minutes between RL evaluations.")
+    rl_group.add_argument("--rl-resume", action=argparse.BooleanOptionalAction, default=True, help="Resume RL from the latest checkpoint.")
+    rl_group.add_argument("--rl-eval-num-samples", type=int, default=2, help="Samples per prompt during RL evaluation.")
+    rl_group.add_argument("--rl-eval-batch-size", type=int, default=4, help="Batch size for categorical RL evaluation.")
+    rl_group.add_argument("--rl-eval-max-new-tokens", type=int, default=256, help="Max new tokens for RL chat evaluation.")
+    rl_group.add_argument("--rl-eval-task", type=str, default="GSM8K", help="Task name for RL evaluation (default: GSM8K).")
+
     args = parser.parse_args()
 
     # Initialize Flyte connection
@@ -735,12 +840,9 @@ if __name__ == "__main__":
     print("Submitting workflow...\n")
 
     # Run the workflow
+    task_kwargs = vars(args).copy()
+    task_kwargs["run_name"] = run_name
     run = flyte.run(
         train_nanochat_end_to_end,
-        run_name=run_name,
-        depth=args.depth,
-        num_shards=args.num_shards,
-        num_iterations=args.num_iterations,
-        device_batch_size=args.device_batch_size,
-        eval_every=args.eval_every,
+        **task_kwargs,
     )
