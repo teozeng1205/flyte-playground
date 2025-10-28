@@ -3,6 +3,7 @@ Full end-to-end nanochat training workflow with WandB logging.
 This workflow trains a nanochat model on 1 GPU with complete epochs.
 """
 
+import re
 import flyte
 from datetime import datetime
 
@@ -757,6 +758,95 @@ def train_nanochat_end_to_end(
     base_cache_dir = os.path.expanduser("~/.cache/nanochat")
     stage_results["report_generate"]["report_path"] = os.path.join(base_cache_dir, "report", "report.md")
     stage_results["report_generate"]["working_copy"] = os.path.join(nanochat_dir, "report.md")
+
+    # ========================================================================
+    # FINAL STAGE: Save latest model checkpoint to WandB artifact
+    # ========================================================================
+    artifact_details = None
+    wandb_api_key = os.environ.get("WANDB_API_KEY")
+    if not wandb_api_key:
+        print("Skipping model artifact upload: WANDB_API_KEY not available.")
+    else:
+        try:
+            import wandb
+            from nanochat.checkpoint_manager import find_largest_model, find_last_step
+        except Exception as exc:  # pragma: no cover - defensive guard
+            print(f"Skipping model artifact upload: wandb unavailable ({exc}).")
+        else:
+            def stage_completed(key: str) -> bool:
+                return stage_results.get(key, {}).get("status") == "completed"
+
+            checkpoint_candidates = [
+                ("chat_rl", "chatrl_checkpoints", rl_run_name, "nanochat-rl"),
+                ("chat_sft", "chatsft_checkpoints", sft_run_name, "nanochat-sft"),
+                ("mid_train", "mid_checkpoints", mid_run_name, "nanochat-mid"),
+                ("base_train", "base_checkpoints", run_name, "nanochat"),
+            ]
+            for stage_key, checkpoint_root, target_run, project in checkpoint_candidates:
+                if not stage_completed(stage_key):
+                    continue
+                root_dir = os.path.join(base_cache_dir, checkpoint_root)
+                try:
+                    model_tag = find_largest_model(root_dir)
+                    checkpoint_dir = os.path.join(root_dir, model_tag)
+                    step = find_last_step(checkpoint_dir)
+                except Exception as exc:
+                    print(f"Skipping {stage_key} checkpoint upload: {exc}")
+                    continue
+
+                artifact_details = {
+                    "stage": stage_key,
+                    "project": project,
+                    "run_name": target_run,
+                    "model_tag": model_tag,
+                    "checkpoint_dir": checkpoint_dir,
+                    "step": step,
+                }
+                break
+
+            if artifact_details:
+                def _slugify(value: str) -> str:
+                    sanitized = re.sub(r"[^A-Za-z0-9._-]+", "-", value.strip())
+                    return sanitized.strip("-") or "model"
+
+                artifact_name = _slugify(f"{artifact_details['run_name']}-{artifact_details['stage']}-ckpt")
+                artifact_type = "model"
+                artifact_dir = artifact_details["checkpoint_dir"]
+                print(f"Uploading checkpoint directory {artifact_dir} to WandB artifact '{artifact_name}'")
+                wandb_run = None
+                try:
+                    wandb_run = wandb.init(
+                        project=artifact_details["project"],
+                        name=f"{artifact_details['run_name']}-artifact-upload",
+                        job_type="model-upload",
+                        reinit=True,
+                    )
+                    artifact = wandb.Artifact(name=artifact_name, type=artifact_type, metadata={
+                        "stage": artifact_details["stage"],
+                        "model_tag": artifact_details["model_tag"],
+                        "step": artifact_details["step"],
+                    })
+                    artifact.add_dir(artifact_dir)
+                    wandb_run.log_artifact(artifact)
+                    wandb_run.finish()
+                    stage_results["model_artifact"] = {
+                        "status": "uploaded",
+                        "artifact_name": artifact_name,
+                        "project": artifact_details["project"],
+                        "checkpoint_dir": artifact_dir,
+                        "step": artifact_details["step"],
+                    }
+                    print(f"WandB artifact '{artifact_name}' uploaded successfully.")
+                except Exception as exc:  # pragma: no cover - runtime failure guard
+                    if wandb_run:
+                        wandb_run.finish()
+                    stage_results["model_artifact"] = {
+                        "status": "failed",
+                        "error": str(exc),
+                    }
+                    print(f"Failed to upload WandB artifact: {exc}")
+            else:
+                print("No completed training stages produced checkpoints for artifact upload.")
 
     final_results = {
         "status": "completed",
