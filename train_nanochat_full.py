@@ -7,6 +7,7 @@ import re
 from enum import StrEnum
 import flyte
 from datetime import datetime
+from pathlib import Path
 
 # Configure the task environment with GPU and all dependencies
 train_env = flyte.TaskEnvironment(
@@ -191,25 +192,109 @@ def train_nanochat_end_to_end(
     print(f"STAGE 2: DOWNLOADING DATA ({num_shards} shards)")
     print("=" * 80)
 
-    # Clone nanochat repo
-    print("\nCloning nanochat repository...")
-    result = subprocess.run(
-        ["git", "clone", "https://github.com/karpathy/nanochat.git"],
-        capture_output=True,
-        text=True
-    )
-    if result.returncode != 0:
-        print(f"Git clone output: {result.stdout}")
-        print(f"Git clone error: {result.stderr}")
-        raise RuntimeError(f"Git clone failed: {result.stderr}")
-    print("Repository cloned successfully!")
-
-    # Change to nanochat directory
-    os.chdir("nanochat")
+    nanochat_dir = os.path.join(os.getcwd(), "nanochat")
+    if not os.path.isdir(nanochat_dir):
+        raise FileNotFoundError(
+            f"Expected nanochat repository at {nanochat_dir}. "
+            "Clone the repository locally before running this workflow."
+        )
+    print(f"Using existing nanochat repository at: {nanochat_dir}")
+    os.chdir(nanochat_dir)
     nanochat_dir = os.getcwd()
     print(f"Working directory: {nanochat_dir}")
 
     stage_results = {}
+    base_cache_path = Path(os.path.expanduser("~/.cache/nanochat"))
+
+    def _slugify(value: str) -> str:
+        sanitized = re.sub(r"[^A-Za-z0-9._-]+", "-", value.strip())
+        return sanitized.strip("-") or "model"
+
+    def upload_stage_checkpoint(stage: TrainingStage, checkpoint_dir_name: str, run_name: str):
+        """
+        Upload the latest checkpoint for a training stage to WandB.
+        """
+        artifact_key = f"{stage.value}_artifact"
+        wandb_api_key = os.environ.get("WANDB_API_KEY")
+        if not wandb_api_key:
+            print(f"Skipping WandB upload for {stage.value}: WANDB_API_KEY not available.")
+            stage_results[artifact_key] = {
+                "status": "skipped_no_wandb",
+            }
+            return
+
+        try:
+            import wandb
+            from nanochat.checkpoint_manager import find_largest_model, find_last_step
+        except Exception as exc:  # pragma: no cover - defensive guard for import issues
+            print(f"Skipping WandB upload for {stage.value}: unable to import dependencies ({exc}).")
+            stage_results[artifact_key] = {
+                "status": "import_failed",
+                "error": str(exc),
+            }
+            return
+
+        checkpoint_root = base_cache_path / checkpoint_dir_name
+        if not checkpoint_root.exists():
+            print(f"Skipping WandB upload for {stage.value}: missing root {checkpoint_root}.")
+            stage_results[artifact_key] = {
+                "status": "missing_root",
+                "expected_root": str(checkpoint_root),
+            }
+            return
+
+        try:
+            model_tag = find_largest_model(str(checkpoint_root))
+            checkpoint_dir = checkpoint_root / model_tag
+            step = find_last_step(str(checkpoint_dir))
+        except Exception as exc:
+            print(f"Skipping WandB upload for {stage.value}: {exc}")
+            stage_results[artifact_key] = {
+                "status": "checkpoint_lookup_failed",
+                "error": str(exc),
+            }
+            return
+
+        artifact_name = _slugify(f"{stage.value}-{run_name}-ckpt-step{step}")
+        wandb_run = None
+        try:
+            wandb_run = wandb.init(
+                project=ARTIFACT_PROJECT,
+                name=_slugify(f"upload-{stage.value}-{run_name}"),
+                job_type=f"{stage.value}-checkpoint",
+                reinit=True,
+            )
+            artifact = wandb.Artifact(
+                name=artifact_name,
+                type="model",
+                metadata={
+                    "stage": stage.value,
+                    "model_tag": model_tag,
+                    "step": step,
+                },
+            )
+            artifact.add_dir(str(checkpoint_dir))
+            wandb_run.log_artifact(artifact)
+            wandb_run.finish()
+        except Exception as exc:
+            if wandb_run:
+                wandb_run.finish()
+            print(f"WandB upload failed for {stage.value}: {exc}")
+            stage_results[artifact_key] = {
+                "status": "upload_failed",
+                "checkpoint_dir": str(checkpoint_dir),
+                "artifact_name": artifact_name,
+                "error": str(exc),
+            }
+            return
+
+        print(f"Uploaded {stage.value} checkpoint (step {step}) to WandB artifact '{artifact_name}'.")
+        stage_results[artifact_key] = {
+            "status": "uploaded",
+            "checkpoint_dir": str(checkpoint_dir),
+            "artifact_name": artifact_name,
+            "step": step,
+        }
 
     def run_stage(stage_key: str, description: str, command: list[str], extra_env: dict | None = None):
         """
@@ -603,6 +688,7 @@ def train_nanochat_end_to_end(
         "checkpoint_dir": f"base_checkpoints/d{depth}",
         "wandb_run": run_name,
     }
+    upload_stage_checkpoint(TrainingStage.BASE_TRAIN, "base_checkpoints", run_name)
 
     # STAGE 4: Base loss & sampling
     base_loss_cmd = [
@@ -644,6 +730,7 @@ def train_nanochat_end_to_end(
         mid_train_cmd,
     )
     stage_results["mid_train"]["run_name"] = mid_run_name
+    upload_stage_checkpoint(TrainingStage.MID_TRAIN, "mid_checkpoints", mid_run_name)
 
     # STAGE 7: Chat evaluation for mid model
     mid_eval_cmd = [
@@ -686,6 +773,7 @@ def train_nanochat_end_to_end(
         sft_cmd,
     )
     stage_results["chat_sft"]["run_name"] = sft_run_name
+    upload_stage_checkpoint(TrainingStage.CHAT_SFT, "chatsft_checkpoints", sft_run_name)
 
     # STAGE 9: Chat evaluation for SFT model
     sft_eval_cmd = [
@@ -733,6 +821,7 @@ def train_nanochat_end_to_end(
     )
     stage_results["chat_rl"]["run_name"] = rl_run_name
     stage_results["chat_rl"]["source"] = "sft"
+    upload_stage_checkpoint(TrainingStage.CHAT_RL, "chatrl_checkpoints", rl_run_name)
 
     # STAGE 11: Chat evaluation for RL model
     rl_eval_cmd = [
@@ -794,6 +883,10 @@ def train_nanochat_end_to_end(
             for stage_key, checkpoint_root, target_run in checkpoint_candidates:
                 if not stage_completed(stage_key):
                     continue
+                artifact_status = stage_results.get(f"{stage_key.value}_artifact", {})
+                if artifact_status.get("status") == "uploaded":
+                    print(f"{stage_key.value} checkpoint already uploaded to WandB as '{artifact_status.get('artifact_name')}'. Skipping duplicate upload.")
+                    continue
                 root_dir = os.path.join(base_cache_dir, checkpoint_root)
                 try:
                     model_tag = find_largest_model(root_dir)
@@ -813,10 +906,6 @@ def train_nanochat_end_to_end(
                 break
 
             if artifact_details:
-                def _slugify(value: str) -> str:
-                    sanitized = re.sub(r"[^A-Za-z0-9._-]+", "-", value.strip())
-                    return sanitized.strip("-") or "model"
-
                 stage_key = artifact_details["stage"]
                 artifact_name = _slugify(f"{stage_key.value}-{artifact_details['run_name']}-ckpt")
                 artifact_type = "model"

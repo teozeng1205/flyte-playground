@@ -144,6 +144,10 @@ def get_batch():
                 )
             # Guard against any unexpected empty returns
             if not generated_token_sequences_batch:
+                print0("Warning: Engine returned no sequences for sampling step; retrying with next index.")
+                continue
+            if not masks_batch:
+                print0("Warning: Engine returned no masks for sampling step; retrying with next index.")
                 continue
             generated_token_sequences.extend(generated_token_sequences_batch)
             masks.extend(masks_batch)
