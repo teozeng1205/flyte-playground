@@ -884,7 +884,7 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="Submit nanochat end-to-end training to Flyte")
     parser.add_argument("--run_name", type=str, default=None, help="W&B run name / job name prefix")
-    parser.add_argument("--depth", type=int, default=4, help="Model depth (smaller = faster). Default: 4")
+    parser.add_argument("--depth", type=int, default=2, help="Model depth (smaller = faster). Default: 4")
     parser.add_argument("--num_shards", type=int, default=5, help="Number of dataset shards to download. Default: 5")
     parser.add_argument("--num_iterations", type=int, default=500, help="Base training iterations. Default: 500")
     parser.add_argument("--device_batch_size", type=int, default=8, help="Per-device batch size. Default: 8")

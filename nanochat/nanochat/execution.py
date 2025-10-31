@@ -162,13 +162,15 @@ def reliability_guard(maximum_memory_bytes: Optional[int] = None):
             new_soft = _desired(soft)
             if new_soft > new_hard:
                 new_soft = new_hard
+            if new_soft == soft and new_hard == hard:
+                return
             try:
                 resource.setrlimit(limit_type, (new_soft, new_hard))
-            except ValueError:
+            except (ValueError, OSError):
                 # Some platforms disallow reducing the hard limit; fall back to keeping it.
                 try:
                     resource.setrlimit(limit_type, (new_soft, hard))
-                except ValueError:
+                except (ValueError, OSError):
                     # Nothing else we can do; leave the original limits in place.
                     pass
 

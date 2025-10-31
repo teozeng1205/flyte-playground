@@ -105,6 +105,7 @@ print0(f"Calculated number of steps: {num_steps}")
 def get_batch():
     assistant_end = tokenizer.encode_special("<|assistant_end|>") # ok to use this token, it's only for padding and isn't used in the loss.
     rank_indices = range(ddp_rank, len(train_task), ddp_world_size) # each rank is responsible for different examples in the training data
+    failure_count = 0
     for example_idx in itertools.cycle(rank_indices):
 
         # First get the full conversation of both user and assistant messages
@@ -119,13 +120,16 @@ def get_batch():
         model.eval() # ensure the model is in eval mode
         generated_token_sequences = []
         masks = []
+        # Impossible to progress without at least one sample
+        if num_samples <= 0:
+            raise ValueError(f"num_samples must be positive; got {num_samples}")
         # Use ceil division so we always run at least once, even if num_samples < device_batch_size
-        num_sampling_steps = max(1, math.ceil(num_samples / device_batch_size))
+        num_sampling_steps = math.ceil(num_samples / device_batch_size)
         for sampling_step in range(num_sampling_steps):
             # Determine how many samples to generate in this pass
-            remaining = max(0, num_samples - sampling_step * device_batch_size)
-            this_batch = device_batch_size if remaining <= 0 else min(device_batch_size, remaining)
-            # If the configured num_samples is 0 (edge case), skip
+            remaining = num_samples - sampling_step * device_batch_size
+            this_batch = min(device_batch_size, remaining)
+            # Safety check (should not happen with the logic above)
             if this_batch <= 0:
                 continue
             seed = hash((step, example_idx, sampling_step)) & 0x7FFFFFFF # positive half of int32
@@ -147,6 +151,15 @@ def get_batch():
         # If generation produced nothing (e.g., misconfiguration), skip this example to avoid crashing
         if not generated_token_sequences:
             print0("Warning: no samples generated for example; skipping")
+            failure_count += 1
+            if failure_count >= 50:
+                raise RuntimeError("Sampling produced no usable sequences for 50 consecutive attempts; check generation settings.")
+            continue
+        if not masks:
+            print0("Warning: no masks returned for generated samples; skipping")
+            failure_count += 1
+            if failure_count >= 50:
+                raise RuntimeError("Sampling produced masks of length zero for 50 consecutive attempts; check generation settings.")
             continue
 
         # Calculate the rewards for each sample
@@ -161,7 +174,13 @@ def get_batch():
             rewards.append(reward)
 
         # Pad the sequences so that their lengths (in time) match
-        max_length = max(len(seq) for seq in generated_token_sequences)
+        max_length = max((len(seq) for seq in generated_token_sequences), default=0)
+        if max_length == 0:
+            print0("Warning: generated samples have zero length; skipping")
+            failure_count += 1
+            if failure_count >= 50:
+                raise RuntimeError("Sampling produced zero-length rollouts for 50 consecutive attempts; check generation settings.")
+            continue
         padded_generated_token_sequences = [seq + [assistant_end] * (max_length - len(seq)) for seq in generated_token_sequences]
         padded_masks = [mask + [0] * (max_length - len(mask)) for mask in masks]
         # Stack up the sequences and masks into PyTorch tensors
@@ -178,6 +197,7 @@ def get_batch():
         mu = rewards.mean()
         advantages = rewards - mu
         # yield inputs/targets as (B, T) of ids and rewards as (B,) of floats
+        failure_count = 0
         yield generated_token_sequences, inputs, targets, rewards, advantages
 
 # -----------------------------------------------------------------------------
