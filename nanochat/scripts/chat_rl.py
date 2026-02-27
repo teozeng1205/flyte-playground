@@ -178,7 +178,15 @@ def get_batch():
             rewards.append(reward)
 
         # Pad the sequences so that their lengths (in time) match
-        max_length = max((len(seq) for seq in generated_token_sequences), default=0)
+        try:
+            max_length = max((len(seq) for seq in generated_token_sequences), default=0)
+        except ValueError:
+            # Defensive guard in case upstream changes regress the empty-sequence checks.
+            print0("Warning: unable to determine rollout length because no sequences were produced; skipping example.")
+            failure_count += 1
+            if failure_count >= 50:
+                raise RuntimeError("Sampling produced no usable sequences for 50 consecutive attempts; check generation settings.")
+            continue
         if max_length == 0:
             print0("Warning: generated samples have zero length; skipping")
             failure_count += 1

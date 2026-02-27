@@ -193,12 +193,38 @@ def train_nanochat_end_to_end(
     print("=" * 80)
 
     nanochat_dir = os.path.join(os.getcwd(), "nanochat")
+    repo_url = os.environ.get("NANOCHAT_REPO_URL", "https://github.com/karpathy/nanochat.git")
+    repo_ref = os.environ.get("NANOCHAT_REPO_REF")
+
     if not os.path.isdir(nanochat_dir):
-        raise FileNotFoundError(
-            f"Expected nanochat repository at {nanochat_dir}. "
-            "Clone the repository locally before running this workflow."
-        )
-    print(f"Using existing nanochat repository at: {nanochat_dir}")
+        print("\nCloning nanochat repository...")
+        clone_cmd = ["git", "clone", repo_url, nanochat_dir]
+        result = subprocess.run(clone_cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            if result.stdout:
+                print(f"Git clone output: {result.stdout}")
+            if result.stderr:
+                print(f"Git clone error: {result.stderr}")
+            raise RuntimeError(
+                f"Git clone failed (exit {result.returncode}) for {repo_url}"
+            )
+        print("Repository cloned successfully!")
+    else:
+        print(f"Using existing nanochat repository at: {nanochat_dir}")
+
+    if repo_ref:
+        print(f"Checking out nanochat ref {repo_ref} ...")
+        checkout_cmd = ["git", "-C", nanochat_dir, "checkout", repo_ref]
+        result = subprocess.run(checkout_cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            if result.stdout:
+                print(f"Git checkout output: {result.stdout}")
+            if result.stderr:
+                print(f"Git checkout error: {result.stderr}")
+            raise RuntimeError(
+                f"Failed to checkout nanochat ref {repo_ref} (exit {result.returncode})."
+            )
+
     os.chdir(nanochat_dir)
     nanochat_dir = os.getcwd()
     print(f"Working directory: {nanochat_dir}")
@@ -973,9 +999,9 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="Submit nanochat end-to-end training to Flyte")
     parser.add_argument("--run_name", type=str, default=None, help="W&B run name / job name prefix")
-    parser.add_argument("--depth", type=int, default=2, help="Model depth (smaller = faster). Default: 4")
-    parser.add_argument("--num_shards", type=int, default=5, help="Number of dataset shards to download. Default: 5")
-    parser.add_argument("--num_iterations", type=int, default=500, help="Base training iterations. Default: 500")
+    parser.add_argument("--depth", type=int, default=8, help="Model depth (smaller = faster). Default: 4")
+    parser.add_argument("--num_shards", type=int, default=400, help="Number of dataset shards to download. Default: 5")
+    parser.add_argument("--num_iterations", type=int, default=5000, help="Base training iterations. Default: 5000")
     parser.add_argument("--device_batch_size", type=int, default=8, help="Per-device batch size. Default: 8")
     parser.add_argument("--eval_every", type=int, default=100, help="Evaluate every N steps. Default: 100")
 
@@ -989,7 +1015,7 @@ if __name__ == "__main__":
 
     mid_group = parser.add_argument_group("mid training", "Parameters for the mid-training stage and evaluation")
     mid_group.add_argument("--mid-device-batch-size", type=int, default=4, help="Per-device batch size for mid training.")
-    mid_group.add_argument("--mid-total-batch-size", type=int, default=32768, help="Total batch size (tokens) for mid training.")
+    mid_group.add_argument("--mid-total-batch-size", type=int, default=16384, help="Total batch size (tokens) for mid training.")
     mid_group.add_argument("--mid-init-lr-frac", type=float, default=0.5, help="Initial learning rate fraction for mid training.")
     mid_group.add_argument("--mid-eval-every", type=int, default=100, help="Evaluation cadence (steps) during mid training.")
     mid_group.add_argument("--mid-eval-num-samples", type=int, default=1, help="Samples per prompt for mid-stage chat evaluation.")
@@ -1002,7 +1028,7 @@ if __name__ == "__main__":
     sft_group.add_argument("--sft-eval-every", type=int, default=100, help="Evaluation cadence (steps) during SFT.")
     sft_group.add_argument("--sft-eval-steps", type=int, default=100, help="Number of evaluation steps during SFT.")
     sft_group.add_argument("--sft-eval-num-samples", type=int, default=1, help="Samples per prompt for SFT chat evaluation.")
-    sft_group.add_argument("--sft-eval-batch-size", type=int, default=4, help="Batch size for categorical SFT evaluation.")
+    sft_group.add_argument("--sft-eval-batch-size", type=int, default=2, help="Batch size for categorical SFT evaluation.")
     sft_group.add_argument("--sft-eval-max-new-tokens", type=int, default=256, help="Max new tokens for SFT chat evaluation.")
     sft_group.add_argument("--sft-eval-task", type=str, default=None, help="Optional override for SFT evaluation task list.")
 
