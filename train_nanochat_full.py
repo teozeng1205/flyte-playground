@@ -21,19 +21,12 @@ train_env = flyte.TaskEnvironment(
             "curl",  # For downloading Rust installer
             "build-essential",  # For building Rust packages
         )
-        .with_pip_packages(
-            "torch",
-            "datasets",
-            "wandb",
-            "tiktoken",
-            "numpy",
-            "regex",
-            "tokenizers",
-            "psutil",
-            "fastapi",
-            "uvicorn",
-            "maturin",  # Required for building rustbpe
-        )
+        # Install all pinned deps (including CUDA torch) from nanochat's lock file.
+        # Image hash is tied to uv.lock, so a rebuild only triggers when deps change.
+        .with_uv_project("nanochat/pyproject.toml", uvlock=Path("nanochat/uv.lock"))
+        # maturin is a dev-only dep in nanochat's pyproject.toml (not picked up above),
+        # but is required at runtime to build the rustbpe Rust extension.
+        .with_pip_packages("maturin")
     ),
     env_vars={
         "PYTORCH_ALLOC_CONF": "expandable_segments:True",
