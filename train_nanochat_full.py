@@ -1041,7 +1041,7 @@ if __name__ == "__main__":
 
     # Initialize Flyte connection
     print("Initializing Flyte connection...")
-    flyte.init_from_config(".flyte/config.yaml", root_dir=Path("."))
+    flyte.init_from_config(".flyte/config.yaml", root_dir=Path.cwd())
 
     # Generate unique run name
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
