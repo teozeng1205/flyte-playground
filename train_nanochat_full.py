@@ -1041,7 +1041,7 @@ if __name__ == "__main__":
 
     # Initialize Flyte connection
     print("Initializing Flyte connection...")
-    flyte.init_from_config(".flyte/config.yaml")
+    flyte.init_from_config(".flyte/config.yaml", root_dir=Path("."))
 
     # Generate unique run name
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -1049,10 +1049,11 @@ if __name__ == "__main__":
     print(f"\nRun name: {run_name}")
     print("Submitting workflow...\n")
 
-    # Run the workflow
+    # Run the workflow — copy_style="all" bundles the entire project (incl. nanochat/)
+    # so the task uses our local fork instead of cloning from karpathy/nanochat.
     task_kwargs = vars(args).copy()
     task_kwargs["run_name"] = run_name
-    run = flyte.run(
+    run = flyte.with_runcontext(copy_style="all").run(
         train_nanochat_end_to_end,
         **task_kwargs,
     )
