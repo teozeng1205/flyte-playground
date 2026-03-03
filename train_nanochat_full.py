@@ -12,7 +12,7 @@ from pathlib import Path
 # Configure the task environment with GPU and all dependencies
 train_env = flyte.TaskEnvironment(
     name="nanochat-full-training",
-    resources=flyte.Resources(cpu=8, memory="32Gi", gpu=1),
+    resources=flyte.Resources(cpu=8, memory="32Gi", gpu="A100:1"),
     image=(
         flyte.Image
         .from_debian_base((3, 12))
@@ -84,6 +84,7 @@ def train_nanochat_end_to_end(
     rl_eval_batch_size: int = 4,
     rl_eval_max_new_tokens: int = 256,
     rl_eval_task: str = "GSM8K",
+    upload_weights_to_wandb: bool = False,
 ) -> dict:
     """
     Complete end-to-end training: download data, train model, log to WandB.
@@ -128,6 +129,7 @@ def train_nanochat_end_to_end(
         rl_eval_batch_size: Batch size for categorical RL evaluation
         rl_eval_max_new_tokens: Max generated tokens for RL chat evaluation
         rl_eval_task: Task name used for RL chat evaluation
+        upload_weights_to_wandb: Upload model checkpoint artifacts to WandB
 
     Returns:
         Training results and metrics
@@ -652,7 +654,7 @@ def train_nanochat_end_to_end(
     print(f"Run name: {run_name}")
     print(f"Depth: {depth}")
     print(f"Iterations: {num_iterations}")
-    print(f"This will take ~1 hour on T4 GPU")
+    print("A100 resource requested via Flyte task resources")
     print("=" * 80 + "\n")
 
     # Prepare training command
@@ -707,7 +709,8 @@ def train_nanochat_end_to_end(
         "checkpoint_dir": f"base_checkpoints/d{depth}",
         "wandb_run": run_name,
     }
-    upload_stage_checkpoint(TrainingStage.BASE_TRAIN, "base_checkpoints", run_name)
+    if upload_weights_to_wandb:
+        upload_stage_checkpoint(TrainingStage.BASE_TRAIN, "base_checkpoints", run_name)
 
     # STAGE 4: Base loss & sampling
     base_loss_cmd = [
@@ -749,7 +752,8 @@ def train_nanochat_end_to_end(
         mid_train_cmd,
     )
     stage_results["mid_train"]["run_name"] = mid_run_name
-    upload_stage_checkpoint(TrainingStage.MID_TRAIN, "mid_checkpoints", mid_run_name)
+    if upload_weights_to_wandb:
+        upload_stage_checkpoint(TrainingStage.MID_TRAIN, "mid_checkpoints", mid_run_name)
 
     # STAGE 7: Chat evaluation for mid model
     mid_eval_cmd = [
@@ -792,7 +796,8 @@ def train_nanochat_end_to_end(
         sft_cmd,
     )
     stage_results["chat_sft"]["run_name"] = sft_run_name
-    upload_stage_checkpoint(TrainingStage.CHAT_SFT, "chatsft_checkpoints", sft_run_name)
+    if upload_weights_to_wandb:
+        upload_stage_checkpoint(TrainingStage.CHAT_SFT, "chatsft_checkpoints", sft_run_name)
 
     # STAGE 9: Chat evaluation for SFT model
     sft_eval_cmd = [
@@ -840,7 +845,8 @@ def train_nanochat_end_to_end(
     )
     stage_results["chat_rl"]["run_name"] = rl_run_name
     stage_results["chat_rl"]["source"] = "sft"
-    upload_stage_checkpoint(TrainingStage.CHAT_RL, "chatrl_checkpoints", rl_run_name)
+    if upload_weights_to_wandb:
+        upload_stage_checkpoint(TrainingStage.CHAT_RL, "chatrl_checkpoints", rl_run_name)
 
     # STAGE 11: Chat evaluation for RL model
     rl_eval_cmd = [
@@ -881,7 +887,9 @@ def train_nanochat_end_to_end(
     # ========================================================================
     artifact_details = None
     wandb_api_key = os.environ.get("WANDB_API_KEY")
-    if not wandb_api_key:
+    if not upload_weights_to_wandb:
+        print("Skipping model artifact upload: upload_weights_to_wandb is False.")
+    elif not wandb_api_key:
         print("Skipping model artifact upload: WANDB_API_KEY not available.")
     else:
         try:
@@ -997,6 +1005,12 @@ if __name__ == "__main__":
     parser.add_argument("--num_iterations", type=int, default=5000, help="Base training iterations. Default: 5000")
     parser.add_argument("--device_batch_size", type=int, default=8, help="Per-device batch size. Default: 8")
     parser.add_argument("--eval_every", type=int, default=100, help="Evaluate every N steps. Default: 100")
+    parser.add_argument(
+        "--upload-weights-to-wandb",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Upload model checkpoint artifacts to WandB.",
+    )
 
     base_group = parser.add_argument_group("base training", "Parameters for base training and loss evaluation")
     base_group.add_argument("--base-total-batch-size", type=int, default=65536, help="Total batch size (tokens) for base training.")
@@ -1057,3 +1071,4 @@ if __name__ == "__main__":
         train_nanochat_end_to_end,
         **task_kwargs,
     )
+    print(f"\nExecution URL: {run.url}")
