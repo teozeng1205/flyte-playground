@@ -44,7 +44,7 @@ class DCOVisualizeConfig:
     finetune_n_estimators_finetune: int = 1
     finetune_n_estimators_validation: int = 1
     finetuned_n_estimators: int = 1
-    finetune_inference_fit_mode: str = "fit_with_cache"
+    finetune_inference_fit_mode: str = "fit_preprocessors"
     finetune_inference_memory_saving_mode: bool | str = False
     n_preprocessing_jobs: int = 8
     embedding_n_fold: int = 0

@@ -245,6 +245,30 @@ def _extract_training_embeddings(
     raise RuntimeError(f"Unable to extract non-empty embeddings for {branch_name} branch") from last_error
 
 
+def _slice_rows(X: Any, n_rows: int) -> Any:
+    if hasattr(X, "iloc"):
+        return X.iloc[:n_rows]
+    return X[:n_rows]
+
+
+def _smoke_validate_inference_regressor(
+    regressor: Any,
+    X_reference: Any,
+    *,
+    branch_name: str,
+) -> None:
+    sample_size = min(len(X_reference), 8)
+    if sample_size <= 0:
+        return
+    X_probe = _slice_rows(X_reference, sample_size)
+    regressor.predict(X_probe)
+    probe_embeddings = collapse_embeddings(regressor.get_embeddings(X_probe, data_source="test"))
+    if len(probe_embeddings) != sample_size:
+        raise ValueError(
+            f"{branch_name} smoke validation returned {len(probe_embeddings)} embeddings for {sample_size} rows."
+        )
+
+
 def _fit_mode_fallbacks(primary_fit_mode: str) -> list[str]:
     fallbacks = [primary_fit_mode]
     if primary_fit_mode != "fit_preprocessors":
@@ -782,6 +806,11 @@ def _fit_finetuned_branch(
                     self.finetuned_inference_regressor_.memory_saving_mode = memory_saving_mode  # type: ignore[attr-defined]
                     self.finetuned_inference_regressor_.n_preprocessing_jobs = config.n_preprocessing_jobs  # type: ignore[attr-defined]
                     self.finetuned_inference_regressor_.fit(self.X_, self.y_)  # type: ignore[arg-type]
+                    _smoke_validate_inference_regressor(
+                        self.finetuned_inference_regressor_,
+                        self.X_,
+                        branch_name="finetuned",
+                    )
                     self.final_inference_fit_mode_used_ = fit_mode
                     self.final_inference_memory_saving_mode_used_ = memory_saving_mode
                     if fit_mode != final_inference_requested_fit_mode:
