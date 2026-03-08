@@ -4,6 +4,7 @@ import json
 import http.client
 import logging
 import os
+import time
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
@@ -16,6 +17,8 @@ import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 import s3fs
+
+from dco_visualize.progress import format_duration, progress_snapshot
 
 METADATA_COLUMNS = ["row_id", "source_uri", "source_row_number", "customer", "sales_date"]
 LOGGER = logging.getLogger(__name__)
@@ -78,6 +81,7 @@ def list_s3_parquet_objects(prefix_uri: str) -> list[str]:
 def collect_parquet_metadata(parquet_uris: list[str]) -> list[ParquetObject]:
     LOGGER.info("Collecting parquet metadata for %d files", len(parquet_uris))
     objects: list[ParquetObject] = []
+    started_at = time.perf_counter()
     for index, uri in enumerate(parquet_uris, start=1):
         with open_uri(uri, "rb") as handle:
             parquet = pq.ParquetFile(handle)
@@ -88,8 +92,18 @@ def collect_parquet_metadata(parquet_uris: list[str]) -> list[ParquetObject]:
                     hour=uri.rstrip("/").split("/")[-2],
                 )
             )
-        if index == len(parquet_uris) or index % 20 == 0:
-            LOGGER.info("Collected parquet metadata for %d/%d files", index, len(parquet_uris))
+        if index == len(parquet_uris) or index % 10 == 0:
+            snapshot = progress_snapshot(index, len(parquet_uris), started_at)
+            LOGGER.info(
+                "Metadata progress: files=%d/%d pct=%.1f elapsed=%s rate=%.2f files/s remaining=%s eta_utc=%s",
+                snapshot.done,
+                snapshot.total,
+                snapshot.percent,
+                format_duration(snapshot.elapsed_seconds),
+                snapshot.rate_per_second,
+                format_duration(snapshot.remaining_seconds),
+                snapshot.eta_utc or "unknown",
+            )
     return objects
 
 
@@ -183,6 +197,7 @@ def sample_parquet_files(
         sales_date,
         total_rows,
     )
+    started_at = time.perf_counter()
 
     global_indices = sample_row_indices(total_rows, sample_size, random_seed)
 
@@ -221,24 +236,33 @@ def sample_parquet_files(
                     cursor = next_cursor
                 batch_offset = batch_end
         file_start = file_end
-        if index == len(parquet_objects) or index % 20 == 0:
+        if index == len(parquet_objects) or index % 10 == 0:
             collected_rows = sum(len(frame) for frame in sample_frames)
+            file_snapshot = progress_snapshot(index, len(parquet_objects), started_at)
+            row_snapshot = progress_snapshot(collected_rows, min(sample_size, total_rows), started_at)
             LOGGER.info(
-                "Sampling progress: files=%d/%d sampled_files=%d collected_rows=%d/%d",
-                index,
-                len(parquet_objects),
-                sampled_files,
+                "Sampling progress: files=%d/%d pct=%.1f rows=%d/%d row_pct=%.1f sampled_files=%d elapsed=%s row_rate=%.0f rows/s remaining=%s eta_utc=%s",
+                file_snapshot.done,
+                file_snapshot.total,
+                file_snapshot.percent,
                 collected_rows,
-                min(sample_size, total_rows),
+                row_snapshot.total,
+                row_snapshot.percent,
+                sampled_files,
+                format_duration(row_snapshot.elapsed_seconds),
+                row_snapshot.rate_per_second,
+                format_duration(row_snapshot.remaining_seconds),
+                row_snapshot.eta_utc or "unknown",
             )
 
     sample_frame = pd.concat(sample_frames, ignore_index=True)
     profile = build_profile(sample_frame, parquet_objects, total_rows, sales_date, customer)
     LOGGER.info(
-        "Completed sampling: sample_rows=%d total_rows=%d parquet_files=%d",
+        "Completed sampling: sample_rows=%d total_rows=%d parquet_files=%d elapsed=%s",
         len(sample_frame),
         total_rows,
         len(parquet_objects),
+        format_duration(time.perf_counter() - started_at),
     )
     return sample_frame, profile
 
@@ -265,9 +289,11 @@ def materialize_parquet_files(
         customer,
         sales_date,
     )
+    started_at = time.perf_counter()
 
     writer: pq.ParquetWriter | None = None
     total_rows = 0
+    expected_total_rows = sum(item.row_count for item in parquet_objects)
     source_schema = _unified_source_schema(parquet_uris)
 
     try:
@@ -301,16 +327,30 @@ def materialize_parquet_files(
                     total_rows += batch.num_rows
                     batch_offset += batch.num_rows
             if index == len(parquet_objects) or index % 10 == 0:
+                file_snapshot = progress_snapshot(index, len(parquet_objects), started_at)
+                row_snapshot = progress_snapshot(total_rows, expected_total_rows, started_at)
                 LOGGER.info(
-                    "Materialization progress: files=%d/%d rows=%d",
-                    index,
-                    len(parquet_objects),
-                    total_rows,
+                    "Materialization progress: files=%d/%d pct=%.1f rows=%d/%d row_pct=%.1f elapsed=%s row_rate=%.0f rows/s remaining=%s eta_utc=%s",
+                    file_snapshot.done,
+                    file_snapshot.total,
+                    file_snapshot.percent,
+                    row_snapshot.done,
+                    row_snapshot.total,
+                    row_snapshot.percent,
+                    format_duration(row_snapshot.elapsed_seconds),
+                    row_snapshot.rate_per_second,
+                    format_duration(row_snapshot.remaining_seconds),
+                    row_snapshot.eta_utc or "unknown",
                 )
     finally:
         if writer is not None:
             writer.close()
-    LOGGER.info("Completed materialization to %s rows=%d", output_path, total_rows)
+    LOGGER.info(
+        "Completed materialization to %s rows=%d elapsed=%s",
+        output_path,
+        total_rows,
+        format_duration(time.perf_counter() - started_at),
+    )
 
     return {
         "output_path": str(output_path),

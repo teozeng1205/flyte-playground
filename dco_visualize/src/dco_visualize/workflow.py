@@ -69,10 +69,11 @@ def profile_and_sample_dco(
     embedding_dims: int,
     output_prefix: str,
     batch_size: int,
-) -> tuple[File, File, File]:
+) -> tuple[File, File, File, File]:
     import pandas as pd
 
     from dco_visualize.io import sample_parquet_files, write_json
+    from dco_visualize.sampling import build_representative_samples_from_parquet
 
     _configure_logging()
     config = DCOVisualizeConfig(
@@ -108,29 +109,34 @@ def profile_and_sample_dco(
     tmpdir = Path(tempfile.mkdtemp(prefix="dco_sample_"))
     sample_path = tmpdir / "sample.parquet"
     train_sample_path = tmpdir / "train_sample.parquet"
+    viz_input_path = tmpdir / "viz_input.parquet"
     profile_path = tmpdir / "profile.json"
 
     sample_frame.to_parquet(sample_path, index=False)
-    if len(sample_frame) <= config.train_rows:
-        train_frame = sample_frame
-    else:
-        train_frame = (
-            sample_frame.sample(n=config.train_rows, random_state=config.random_seed)
-            .sort_values("row_id")
-            .reset_index(drop=True)
-        )
-    train_frame.to_parquet(train_sample_path, index=False)
+    representative_stats = build_representative_samples_from_parquet(
+        sample_path,
+        train_rows=min(config.train_rows, len(sample_frame)),
+        viz_rows=min(config.viz_rows, len(sample_frame)),
+        random_seed=config.random_seed,
+        batch_size=config.batch_size,
+        config=config,
+        train_output_path=train_sample_path,
+        viz_output_path=viz_input_path,
+    )
+    profile["representative_sampling"] = representative_stats
     write_json(profile_path, profile)
     LOGGER.info(
-        "Completed sampling: sampled_rows=%d train_rows=%d parquet_files=%d elapsed=%.2fs",
+        "Completed sampling: sampled_rows=%d train_rows=%d viz_input_rows=%d parquet_files=%d elapsed=%.2fs",
         len(sample_frame),
-        len(train_frame),
+        representative_stats["train_rows"],
+        representative_stats["viz_rows"],
         profile["parquet_file_count"],
         time.perf_counter() - started_at,
     )
     return (
         File.from_local_sync(str(sample_path)),
         File.from_local_sync(str(train_sample_path)),
+        File.from_local_sync(str(viz_input_path)),
         File.from_local_sync(str(profile_path)),
     )
 
@@ -139,6 +145,7 @@ def profile_and_sample_dco(
 def fit_embedding_artifacts(
     sample_file: File,
     train_sample_file: File,
+    viz_input_file: File,
     customer: str,
     sales_date: str,
     sample_rows: int,
@@ -151,7 +158,12 @@ def fit_embedding_artifacts(
     import pandas as pd
 
     from dco_visualize.io import write_json
-    from dco_visualize.model import fit_embedding_model, transform_parquet_file, write_embedding_bundle
+    from dco_visualize.model import (
+        aggregate_parquet_file,
+        fit_embedding_model,
+        transform_parquet_file,
+        write_embedding_bundle,
+    )
 
     _configure_logging()
     config = DCOVisualizeConfig(
@@ -177,11 +189,13 @@ def fit_embedding_artifacts(
 
     sample_path = sample_file.download_sync()
     train_sample_path = train_sample_file.download_sync()
+    viz_input_path = viz_input_file.download_sync()
     train_frame = pd.read_parquet(train_sample_path)
     LOGGER.info(
-        "Downloaded staged inputs: sample_path=%s train_sample_path=%s train_rows=%d",
+        "Downloaded staged inputs: sample_path=%s train_sample_path=%s viz_input_path=%s train_rows=%d",
         sample_path,
         train_sample_path,
+        viz_input_path,
         len(train_frame),
     )
     fit_result = fit_embedding_model(train_frame, config)
@@ -200,12 +214,21 @@ def fit_embedding_artifacts(
 
     viz_frame, aggregate_frame, transform_metrics = transform_parquet_file(
         model=fit_result.model,
-        parquet_path=sample_path,
+        parquet_path=viz_input_path,
         output_path=embeddings_path,
-        viz_rows=config.viz_rows,
+        viz_rows=min(config.dashboard_point_cap, config.viz_rows),
         batch_size=config.batch_size,
         random_seed=config.random_seed,
     )
+    full_day_aggregate_frame = aggregate_parquet_file(
+        model=fit_result.model,
+        parquet_path=sample_path,
+        batch_size=config.batch_size,
+    )
+    viz_only_views = aggregate_frame[
+        aggregate_frame["view"].isin(["segment_size", "segment_fingerprint", "segment_agreement"])
+    ].copy()
+    aggregate_frame = pd.concat([full_day_aggregate_frame, viz_only_views], ignore_index=True)
     viz_frame.to_parquet(viz_sample_path, index=False)
     aggregate_frame.to_parquet(aggregate_path, index=False)
     write_embedding_bundle(bundle_path, fit_result.model)
@@ -314,6 +337,7 @@ def render_artifacts(
         hover_columns=metrics["hover_columns"],
         customer=config.customer,
         sales_date=config.sales_date,
+        profile=profile,
         total_points=metrics["viz_rows"],
         total_rows=profile["total_rows"],
         parquet_file_count=profile["parquet_file_count"],
@@ -403,14 +427,15 @@ def execute(
     customer: str = "AA",
     sales_date: str = "2026-03-07",
     sample_rows: int = 100_000,
-    train_rows: int = 1_000_000,
-    viz_rows: int = 200_000,
+    train_rows: int = 50_000,
+    viz_rows: int = 500_000,
     embedding_dims: int = 128,
     output_prefix: str = "s3://3v-teo-dev/dco_visualize/",
     batch_size: int = 50_000,
     run_timestamp: str = "",
     sample_file: File | None = None,
     train_sample_file: File | None = None,
+    viz_input_file: File | None = None,
     profile_file: File | None = None,
     parquet_uris: list[str] | None = None,
     upload_urls: dict[str, str] | None = None,
@@ -423,13 +448,13 @@ def execute(
         sample_rows,
         train_rows,
         viz_rows,
-        sample_file is not None and train_sample_file is not None and profile_file is not None,
+        sample_file is not None and train_sample_file is not None and viz_input_file is not None and profile_file is not None,
     )
-    if sample_file is None or train_sample_file is None or profile_file is None:
+    if sample_file is None or train_sample_file is None or viz_input_file is None or profile_file is None:
         if not parquet_uris:
             raise ValueError("Either staged sample/profile inputs or parquet_uris must be provided.")
         LOGGER.info("No staged inputs supplied; sampling from parquet URIs inside Flyte")
-        sample_file, train_sample_file, profile_file = profile_and_sample_dco(
+        sample_file, train_sample_file, viz_input_file, profile_file = profile_and_sample_dco(
             parquet_uris=parquet_uris,
             customer=customer,
             sales_date=sales_date,
@@ -447,6 +472,7 @@ def execute(
     embeddings_file, viz_sample_file, aggregate_file, bundle_file, metrics_file = fit_embedding_artifacts(
         sample_file=sample_file,
         train_sample_file=train_sample_file,
+        viz_input_file=viz_input_file,
         customer=customer,
         sales_date=sales_date,
         sample_rows=sample_rows,

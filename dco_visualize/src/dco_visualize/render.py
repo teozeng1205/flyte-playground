@@ -55,6 +55,18 @@ def build_visualization_frame(frame: pd.DataFrame, viz_rows: int, random_seed: i
     return frame.sample(n=viz_rows, random_state=random_seed).reset_index(drop=True)
 
 
+def _format_metric_value(value: object, *, precision: int = 3, percentage: bool = False) -> str:
+    if value is None:
+        return "n/a"
+    if isinstance(value, (np.floating, float)):
+        if np.isnan(value):
+            return "n/a"
+        return f"{value * 100:.1f}%" if percentage else f"{value:.{precision}f}"
+    if isinstance(value, (np.integer, int)):
+        return f"{value:,}"
+    return str(value)
+
+
 def _build_branch_embedding_figure(
     frame: pd.DataFrame, branch: str, hover_columns: Iterable[str]
 ) -> go.Figure:
@@ -457,6 +469,7 @@ def render_standalone_dashboard(
     hover_columns: Iterable[str],
     customer: str,
     sales_date: str,
+    profile: dict[str, object] | None,
     total_points: int,
     total_rows: int,
     parquet_file_count: int,
@@ -509,6 +522,14 @@ def render_standalone_dashboard(
 
     pretrained_metrics = metrics.get("pretrained", {})
     finetuned_metrics = metrics.get("finetuned", {})
+    representative = (profile or {}).get("representative_sampling", {}) if profile else {}
+    quality = representative.get("quality", {}) if isinstance(representative, dict) else {}
+    train_quality = quality.get("train", {}) if isinstance(quality, dict) else {}
+    viz_quality = quality.get("viz", {}) if isinstance(quality, dict) else {}
+    embedded_rows = int(metrics.get("embedded_rows", total_points) or total_points)
+    train_rows = int(metrics.get("train_rows", 0) or 0)
+    duplicate_fraction = float(metrics.get("duplicate_feature_fraction", 0.0) or 0.0)
+    duplicate_compression = 1.0 / max(1.0 - duplicate_fraction, 1e-9) if duplicate_fraction < 1.0 else float("inf")
     LOGGER.info("Dashboard render complete for customer=%s sales_date=%s", customer, sales_date)
     return f"""
 <!DOCTYPE html>
@@ -679,7 +700,9 @@ def render_standalone_dashboard(
 
     <section class="card-grid">
       <div class="stat-card"><div class="label">Total Rows</div><div class="value">{total_rows:,}</div></div>
-      <div class="stat-card"><div class="label">Viz Sample</div><div class="value">{total_points:,}</div></div>
+      <div class="stat-card"><div class="label">Train Context</div><div class="value">{train_rows:,}</div></div>
+      <div class="stat-card"><div class="label">Embedded Rows</div><div class="value">{embedded_rows:,}</div></div>
+      <div class="stat-card"><div class="label">Dashboard Points</div><div class="value">{total_points:,}</div></div>
       <div class="stat-card"><div class="label">Pretrained Segments</div><div class="value">{metrics.get("pretrained_segment_count", 0)}</div></div>
       <div class="stat-card"><div class="label">Fine-tuned Segments</div><div class="value">{metrics.get("finetuned_segment_count", 0)}</div></div>
       <div class="stat-card"><div class="label">Pretrained Trust</div><div class="value">{metrics.get("pretrained_projection_trustworthiness", 0.0):.3f}</div></div>
@@ -706,6 +729,18 @@ def render_standalone_dashboard(
           <dt>Estimators</dt><dd>{finetuned_metrics.get("n_estimators_final_inference", "n/a")}</dd>
           <dt>Validation RMSE</dt><dd>{finetuned_metrics.get("rmse") or "n/a"}</dd>
           <dt>Validation MAE</dt><dd>{finetuned_metrics.get("mae") or "n/a"}</dd>
+        </dl>
+      </div>
+      <div class="panel metrics-panel">
+        <h2>Representative Sampling</h2>
+        <dl>
+          <dt>Train metro coverage</dt><dd>{_format_metric_value(train_quality.get("metro_market_coverage"), percentage=True)}</dd>
+          <dt>Viz metro coverage</dt><dd>{_format_metric_value(viz_quality.get("metro_market_coverage"), percentage=True)}</dd>
+          <dt>Top airport coverage</dt><dd>{_format_metric_value(train_quality.get("top_airport_market_coverage"), percentage=True)}</dd>
+          <dt>Trip type abs error</dt><dd>{_format_metric_value(train_quality.get("trip_type_abs_error"))}</dd>
+          <dt>Carrier abs error</dt><dd>{_format_metric_value(train_quality.get("carrier_top_abs_error"))}</dd>
+          <dt>Low-fare share delta</dt><dd>{_format_metric_value(train_quality.get("low_price_share_delta"), percentage=True)}</dd>
+          <dt>Dedup compression</dt><dd>{_format_metric_value(duplicate_compression)}</dd>
         </dl>
       </div>
     </section>

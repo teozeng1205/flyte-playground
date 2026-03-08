@@ -65,11 +65,28 @@ def test_render_standalone_dashboard_generates_plotly_document(tmp_path: Path) -
         hover_columns=["carrier", "origin_metro", "destination_metro"],
         customer="AA",
         sales_date="2026-03-07",
+        profile={
+            "representative_sampling": {
+                "quality": {
+                    "train": {
+                        "metro_market_coverage": 1.0,
+                        "top_airport_market_coverage": 1.0,
+                        "trip_type_abs_error": 0.01,
+                        "carrier_top_abs_error": 0.02,
+                        "low_price_share_delta": 0.03,
+                    },
+                    "viz": {"metro_market_coverage": 1.0},
+                }
+            }
+        },
         total_points=5000,
         total_rows=10000,
         parquet_file_count=12,
         hours_present=["00", "01", "02"],
         metrics={
+            "train_rows": 50000,
+            "embedded_rows": 200000,
+            "duplicate_feature_fraction": 0.2,
             "pretrained_segment_count": 3,
             "finetuned_segment_count": 3,
             "pretrained_projection_trustworthiness": 0.91,
@@ -82,6 +99,7 @@ def test_render_standalone_dashboard_generates_plotly_document(tmp_path: Path) -
 
     assert "DCO TabPFN 2.5 Dashboard" in html
     assert "Embedding Comparison" in html
+    assert "Representative Sampling" in html
     assert "plotly" in html.lower()
 
 

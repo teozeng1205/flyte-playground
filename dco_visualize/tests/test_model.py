@@ -10,7 +10,13 @@ from dco_visualize.model import (
     FitResult,
     SegmenterModel,
     TabPFNEmbeddingModel,
+    _extract_training_embeddings,
+    _prediction_metrics,
+    _winsor_bounds,
+    _winsorized_prediction_metrics,
+    aggregate_parquet_file,
     fit_embedding_model,
+    summarize_target_distribution,
     transform_parquet_file,
 )
 
@@ -39,6 +45,13 @@ class FakePredictor:
 class FakeClusterer:
     def predict(self, embeddings: np.ndarray) -> np.ndarray:
         return (embeddings[:, 0] >= np.median(embeddings[:, 0])).astype(np.int64)
+
+
+class EmptyTrainEmbeddingPredictor(FakePredictor):
+    def get_embeddings(self, X: pd.DataFrame, data_source: str = "test") -> np.ndarray:
+        if data_source == "train":
+            return np.zeros((1, 0, 192), dtype=np.float32)
+        return super().get_embeddings(X, data_source=data_source)
 
 
 def make_fake_branch(name: str, offset: float) -> BranchState:
@@ -118,13 +131,16 @@ def test_transform_parquet_file_emits_branch_embeddings_and_views(tmp_path) -> N
 
     transformed = pd.read_parquet(output_path)
     assert len(transformed) == len(frame)
-    assert {"pretrained_emb_000", "finetuned_emb_000"} <= set(transformed.columns)
-    assert {"pretrained_segment_id", "finetuned_segment_id"} <= set(transformed.columns)
+    assert {"finetuned_emb_000", "finetuned_segment_id"} <= set(transformed.columns)
+    assert "pretrained_emb_000" not in transformed.columns
+    assert "pretrained_segment_id" not in transformed.columns
     assert {"pretrained_layout_x", "pretrained_layout_y", "finetuned_layout_x", "finetuned_layout_y", "layout_method"} <= set(
         viz_frame.columns
     )
     assert viz_frame["layout_method"].eq("densmap").all()
     assert metrics["embedded_rows"] == len(frame)
+    assert metrics["full_day_embedding_branches"] == ["finetuned"]
+    assert metrics["viz_embedding_branches"] == ["pretrained", "finetuned"]
     assert {
         "route_network",
         "market_matrix",
@@ -133,3 +149,126 @@ def test_transform_parquet_file_emits_branch_embeddings_and_views(tmp_path) -> N
         "segment_agreement",
         "segment_size",
     } <= set(aggregate_frame["view"].unique())
+
+
+def test_extract_training_embeddings_falls_back_to_test_source() -> None:
+    frame = make_dco_frame(rows=6)
+    predictor = EmptyTrainEmbeddingPredictor(offset=1.0)
+
+    embeddings, source = _extract_training_embeddings(
+        predictor,
+        frame[["advance_purchase", "origin_metro"]],
+        branch_name="pretrained",
+    )
+
+    assert source == "test"
+    assert embeddings.shape == (6, 3)
+
+
+def test_aggregate_parquet_file_emits_full_day_views(tmp_path) -> None:
+    frame = make_dco_frame(rows=18)
+    config = DCOVisualizeConfig(sample_rows=len(frame), train_rows=12, viz_rows=12)
+    model = TabPFNEmbeddingModel(
+        config=config,
+        target_column="price_inc",
+        feature_columns=[column for column in frame.columns if column not in {"price_inc", "row_id", "source_uri", "source_row_number", "customer", "sales_date"}],
+        feature_kinds={
+            column: ("numeric" if pd.api.types.is_numeric_dtype(frame[column]) and not pd.api.types.is_bool_dtype(frame[column]) else "categorical")
+            for column in frame.columns
+            if column not in {"price_inc", "row_id", "source_uri", "source_row_number", "customer", "sales_date"}
+        },
+        categorical_feature_indices=[],
+        excluded_columns={},
+        retained_columns=list(frame.columns),
+        hover_columns=["carrier", "origin_metro", "destination_metro"],
+        pretrained=make_fake_branch("pretrained", offset=1.0),
+        finetuned=make_fake_branch("finetuned", offset=2.0),
+        route_source_column="origin_metro",
+        route_destination_column="destination_metro",
+        departure_date_column="outbound_departure_date",
+        advance_purchase_column="advance_purchase",
+        return_date_column="inbound_departure_date",
+    )
+
+    input_path = tmp_path / "full_day.parquet"
+    frame.to_parquet(input_path, index=False)
+
+    aggregate_frame = aggregate_parquet_file(model=model, parquet_path=input_path, batch_size=5)
+
+    assert not aggregate_frame.empty
+    assert {"route_network", "market_matrix", "fare_calendar"} <= set(aggregate_frame["view"].unique())
+
+
+def test_transform_parquet_file_handles_all_null_string_batches(tmp_path) -> None:
+    frame = make_dco_frame(rows=12)
+    for column in [
+        "inbound_booking_class",
+        "inbound_codeshare",
+        "inbound_departure_timeband",
+        "inbound_fare_basis",
+        "inbound_fare_family",
+        "inbound_travel_stop_over",
+    ]:
+        frame[column] = [None] * 6 + ["X"] * 6
+
+    config = DCOVisualizeConfig(sample_rows=len(frame), train_rows=8, viz_rows=6)
+    model = TabPFNEmbeddingModel(
+        config=config,
+        target_column="price_inc",
+        feature_columns=[column for column in frame.columns if column not in {"price_inc", "row_id", "source_uri", "source_row_number", "customer", "sales_date"}],
+        feature_kinds={
+            column: ("numeric" if pd.api.types.is_numeric_dtype(frame[column]) and not pd.api.types.is_bool_dtype(frame[column]) else "categorical")
+            for column in frame.columns
+            if column not in {"price_inc", "row_id", "source_uri", "source_row_number", "customer", "sales_date"}
+        },
+        categorical_feature_indices=[],
+        excluded_columns={},
+        retained_columns=list(frame.columns),
+        hover_columns=["carrier", "origin_metro", "destination_metro"],
+        pretrained=make_fake_branch("pretrained", offset=1.0),
+        finetuned=make_fake_branch("finetuned", offset=2.0),
+        route_source_column="origin_metro",
+        route_destination_column="destination_metro",
+        departure_date_column="outbound_departure_date",
+        advance_purchase_column="advance_purchase",
+        return_date_column="inbound_departure_date",
+    )
+
+    input_path = tmp_path / "sample_null_batches.parquet"
+    output_path = tmp_path / "embeddings_null_batches.parquet"
+    frame.to_parquet(input_path, index=False)
+
+    viz_frame, _, metrics = transform_parquet_file(
+        model=model,
+        parquet_path=input_path,
+        output_path=output_path,
+        viz_rows=config.viz_rows,
+        batch_size=3,
+        random_seed=config.random_seed,
+    )
+
+    transformed = pd.read_parquet(output_path)
+    assert len(transformed) == len(frame)
+    assert "inbound_booking_class" in transformed.columns
+    assert metrics["embedded_rows"] == len(frame)
+    assert len(viz_frame) == config.viz_rows
+
+
+def test_target_tail_metrics_show_outlier_domination() -> None:
+    y_true = pd.Series([100.0, 110.0, 120.0, 130.0, 18_000_000.0])
+    y_pred = np.array([105.0, 115.0, 125.0, 135.0, 400_000.0], dtype=np.float64)
+
+    raw_metrics = _prediction_metrics(y_true, y_pred)
+    lower, upper = _winsor_bounds(y_true, 0.8)
+    winsorized_metrics = _winsorized_prediction_metrics(
+        y_true,
+        y_pred,
+        lower=lower,
+        upper=upper,
+    )
+    target_stats = summarize_target_distribution(y_true)
+
+    assert target_stats["rows_gt_1m"] == 1
+    assert raw_metrics["rmse"] is not None
+    assert winsorized_metrics["winsorized_rmse"] is not None
+    assert raw_metrics["rmse"] > winsorized_metrics["winsorized_rmse"]

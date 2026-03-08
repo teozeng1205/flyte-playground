@@ -29,6 +29,7 @@ from dco_visualize.io import (
     sample_parquet_files,
     write_json,
 )
+from dco_visualize.sampling import build_representative_samples_from_parquet
 from dco_visualize.workflow import execute
 
 LOGGER = logging.getLogger(__name__)
@@ -65,8 +66,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--viz-rows",
         type=int,
-        default=50_000,
-        help="Rows retained for embedding comparison and dashboard diagnostics.",
+        default=500_000,
+        help="Representative rows retained for embedding comparison before dashboard downsampling.",
     )
     parser.add_argument(
         "--full-day",
@@ -87,7 +88,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--batch-size",
         type=int,
-        default=10_000,
+        default=50_000,
         help="Parquet batch size used during streaming sample extraction and full-day transforms.",
     )
     parser.add_argument(
@@ -155,6 +156,7 @@ def main() -> None:
     staging_dir = Path(tempfile.mkdtemp(prefix="dco_visualize_submit_"))
     sample_path = staging_dir / "sample.parquet"
     train_sample_path = staging_dir / "train_sample.parquet"
+    viz_input_path = staging_dir / "viz_input.parquet"
     profile_path = staging_dir / "profile.json"
 
     if config.sample_rows >= total_rows:
@@ -166,18 +168,37 @@ def main() -> None:
             output_path=sample_path,
             parquet_objects=parquet_objects,
         )
-        train_frame, profile = sample_parquet_files(
-            parquet_uris=parquet_uris,
-            sample_size=config.train_rows,
-            customer=config.customer,
-            sales_date=config.sales_date,
+        profile = {
+            "customer": config.customer,
+            "sales_date": config.sales_date,
+            "source_prefix": parquet_uris[0].rsplit("/", 2)[0] + "/",
+            "parquet_file_count": len(parquet_objects),
+            "total_rows": total_rows,
+            "sample_rows": int(total_rows),
+            "train_rows": int(config.train_rows),
+            "fit_rows": int(config.train_rows),
+            "column_count": 0,
+            "hours_present": sorted({item.hour for item in parquet_objects}),
+            "row_counts_by_file": [{"uri": item.uri, "rows": item.row_count, "hour": item.hour} for item in parquet_objects],
+        }
+        representative_stats = build_representative_samples_from_parquet(
+            sample_path,
+            train_rows=config.train_rows,
+            viz_rows=config.viz_rows,
             random_seed=config.random_seed,
             batch_size=config.batch_size,
-            parquet_objects=parquet_objects,
+            config=config,
+            train_output_path=train_sample_path,
+            viz_output_path=viz_input_path,
         )
-        train_frame.to_parquet(train_sample_path, index=False)
+        profile["representative_sampling"] = representative_stats
         write_json(profile_path, profile)
-        LOGGER.info("Prepared full-day parquet with %s rows for remote execution", f"{config.sample_rows:,}")
+        LOGGER.info(
+            "Prepared full-day parquet with %s rows and representative train/viz samples train_rows=%s viz_rows=%s",
+            f"{config.sample_rows:,}",
+            f"{representative_stats['train_rows']:,}",
+            f"{representative_stats['viz_rows']:,}",
+        )
     else:
         sample_frame, profile = sample_parquet_files(
             parquet_uris=parquet_uris,
@@ -189,17 +210,24 @@ def main() -> None:
             parquet_objects=parquet_objects,
         )
         sample_frame.to_parquet(sample_path, index=False)
-        if len(sample_frame) <= config.train_rows:
-            train_frame = sample_frame
-        else:
-            train_frame = (
-                sample_frame.sample(n=config.train_rows, random_state=config.random_seed)
-                .sort_values("row_id")
-                .reset_index(drop=True)
-            )
-        train_frame.to_parquet(train_sample_path, index=False)
+        representative_stats = build_representative_samples_from_parquet(
+            sample_path,
+            train_rows=min(config.train_rows, len(sample_frame)),
+            viz_rows=min(config.viz_rows, len(sample_frame)),
+            random_seed=config.random_seed,
+            batch_size=config.batch_size,
+            config=config,
+            train_output_path=train_sample_path,
+            viz_output_path=viz_input_path,
+        )
+        profile["representative_sampling"] = representative_stats
         write_json(profile_path, profile)
-        LOGGER.info("Prepared %s staged rows for remote execution", f"{len(sample_frame):,}")
+        LOGGER.info(
+            "Prepared %s staged rows with representative train/viz samples train_rows=%s viz_rows=%s",
+            f"{len(sample_frame):,}",
+            f"{representative_stats['train_rows']:,}",
+            f"{representative_stats['viz_rows']:,}",
+        )
 
     config_path = REPO_ROOT / ".flyte" / "config.yaml"
     flyte_config = Config.auto(config_path)
@@ -267,6 +295,7 @@ def main() -> None:
         run_timestamp=run_timestamp,
         sample_file=File.from_local_sync(sample_path),
         train_sample_file=File.from_local_sync(train_sample_path),
+        viz_input_file=File.from_local_sync(viz_input_path),
         profile_file=File.from_local_sync(profile_path),
         upload_urls=upload_urls,
     )
