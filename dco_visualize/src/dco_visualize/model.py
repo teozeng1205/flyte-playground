@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import json
+import logging
 import math
-import re
+import os
 from collections import Counter, defaultdict
 from dataclasses import asdict, dataclass
-from functools import lru_cache
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 
@@ -14,67 +16,31 @@ import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
 import umap
 from sklearn.cluster import MiniBatchKMeans
 from sklearn.manifold import trustworthiness
-from torch.utils.data import DataLoader, TensorDataset
+from sklearn.metrics import mean_absolute_error, mean_squared_error
+from sklearn.model_selection import train_test_split
 
 from dco_visualize.config import DCOVisualizeConfig
-from dco_visualize.io import METADATA_COLUMNS, parquet_row_count, sample_row_indices
+from dco_visualize.io import METADATA_COLUMNS, sample_row_indices
 
-TIME_LIKE_PATTERN = re.compile(r"(date|time|timestamp|datetime|observation|depart)", re.IGNORECASE)
-MONEY_LIKE_PATTERN = re.compile(r"(price|fare|tax|rate)", re.IGNORECASE)
-DURATION_PATTERN = re.compile(r"(duration|gcm)", re.IGNORECASE)
-TRUE_VALUES = {"1", "true", "t", "yes", "y"}
-FALSE_VALUES = {"0", "0.0", "false", "f", "no", "n"}
-EPSILON = 1e-6
+LOGGER = logging.getLogger(__name__)
 
-PREFERRED_CONTEXT_COLUMNS = [
+PREFERRED_HOVER_COLUMNS = [
     "carrier",
     "source",
-    "channel",
-    "pos",
-    "currency",
     "trip_type",
-    "stops",
     "cabin",
+    "stops",
     "origin",
     "destination",
     "origin_city",
     "destination_city",
     "origin_metro",
     "destination_metro",
-    "origin_country",
-    "destination_country",
     "outbound_departure_date",
     "inbound_departure_date",
-    "advance_purchase",
-    "length_of_stay",
-    "price_inc",
-    "price_exc",
-    "tax",
-    "outbound_flight_duration",
-    "inbound_flight_duration",
-    "outbound_gcm",
-]
-
-PREFERRED_HOVER_COLUMNS = [
-    "market_token",
-    "carrier",
-    "source",
-    "trip_type",
-    "stops",
-    "cabin",
-    "origin",
-    "destination",
-    "origin_metro",
-    "destination_metro",
-    "outbound_departure_date",
-    "inbound_departure_date",
-    "advance_purchase",
-    "length_of_stay",
     "price_inc",
 ]
 
@@ -84,24 +50,13 @@ FINGERPRINT_FEATURES = [
     "cabin",
     "source",
     "carrier",
-    "market_token",
+    "origin",
+    "destination",
+    "origin_city",
+    "destination_city",
+    "origin_metro",
+    "destination_metro",
 ]
-
-
-@dataclass
-class SchemaProfile:
-    numeric_columns: list[str]
-    boolean_columns: list[str]
-    categorical_columns: list[str]
-    datetime_columns: list[str]
-    excluded_columns: dict[str, str]
-    retained_columns: list[str]
-    hover_columns: list[str]
-    money_columns: list[str]
-    duration_columns: list[str]
-
-    def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
 
 
 @dataclass
@@ -112,1020 +67,805 @@ class ProjectionSpec:
 
 @dataclass
 class FitResult:
-    model: "TabularEmbeddingModel"
+    model: "TabPFNEmbeddingModel"
     metrics: dict[str, Any]
 
 
 @dataclass
 class AggregateRecord:
     view: str
+    branch: str | None
     key_1: str | None
     key_2: str | None
     key_3: str | None
     segment_id: int | None
     count: int
-    mean_log_price: float | None
     mean_price: float | None
     value: float | None
 
 
-@lru_cache(maxsize=1)
-def load_city_lookup() -> pd.DataFrame:
-    lookup_path = (
-        Path(__file__).resolve().parents[3]
-        / "json2vec"
-        / "src"
-        / "json2vec"
-        / "tasks"
-        / "metrics"
-        / "citylocation.csv"
-    )
-    frame = pd.read_csv(lookup_path)
-    frame = frame.rename(columns={"citycode": "code", "countrycode": "country"})
-    frame = frame[frame["latitude"].astype(str) != "(null)"].copy()
-    frame = frame[frame["longitude"].astype(str) != "(null)"].copy()
-    frame["code"] = frame["code"].astype(str)
-    frame["country"] = frame["country"].astype(str)
-    frame["latitude"] = pd.to_numeric(frame["latitude"], errors="coerce")
-    frame["longitude"] = pd.to_numeric(frame["longitude"], errors="coerce")
-    frame = frame.dropna(subset=["latitude", "longitude"])
-    return frame[["code", "country", "latitude", "longitude"]].drop_duplicates("code").reset_index(drop=True)
+@dataclass
+class SegmenterModel:
+    kind: str
+    model: Any
+    n_clusters: int
+
+    def predict(self, embeddings: np.ndarray) -> np.ndarray:
+        if len(embeddings) == 0:
+            return np.empty((0,), dtype=np.int64)
+        if self.kind == "hdbscan":
+            labels, _ = hdbscan.prediction.approximate_predict(self.model, embeddings)
+            return labels.astype(np.int64, copy=False)
+        return self.model.predict(embeddings).astype(np.int64, copy=False)
 
 
-def _coerce_boolean(series: pd.Series) -> pd.Series:
-    if pd.api.types.is_bool_dtype(series):
-        return series.astype("float32")
-    text = series.astype("string").str.lower()
-    mapped = text.map({value: 1.0 for value in TRUE_VALUES} | {value: 0.0 for value in FALSE_VALUES})
-    return pd.to_numeric(mapped, errors="coerce").astype("float32")
+@dataclass
+class BranchState:
+    name: str
+    model: Any
+    embedding_model: Any
+    segmenter: SegmenterModel
+    embedding_dim: int
+    prediction_metrics: dict[str, Any]
+    projection: ProjectionSpec | None = None
+    projector: Any | None = None
+    segment_labels: list[int] | None = None
+
+    def predict(self, X: pd.DataFrame) -> np.ndarray:
+        return np.asarray(self.model.predict(X), dtype=np.float32)
+
+    def get_embeddings(self, X: pd.DataFrame, data_source: str) -> np.ndarray:
+        raw = self.embedding_model.get_embeddings(X, data_source=data_source)
+        return collapse_embeddings(raw)
 
 
-def _series_is_datetime(series: pd.Series, column: str, config: DCOVisualizeConfig) -> bool:
-    if not TIME_LIKE_PATTERN.search(column):
-        return False
-    parsed = pd.to_datetime(series.astype("string"), errors="coerce", utc=True)
-    return float(parsed.notna().mean()) >= config.datetime_success_ratio
+@dataclass
+class TabPFNEmbeddingModel:
+    config: DCOVisualizeConfig
+    target_column: str
+    feature_columns: list[str]
+    feature_kinds: dict[str, str]
+    categorical_feature_indices: list[int]
+    excluded_columns: dict[str, str]
+    retained_columns: list[str]
+    hover_columns: list[str]
+    pretrained: BranchState
+    finetuned: BranchState
+    route_source_column: str
+    route_destination_column: str
+    departure_date_column: str
+    advance_purchase_column: str
+    return_date_column: str
+
+    def transform(self, frame: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, Any]]:
+        return transform_frame(self, frame)
 
 
-def infer_schema(frame: pd.DataFrame, config: DCOVisualizeConfig) -> SchemaProfile:
-    numeric_columns: list[str] = []
-    boolean_columns: list[str] = []
-    categorical_columns: list[str] = []
-    datetime_columns: list[str] = []
+@dataclass
+class AggregateAccumulator:
+    route_stats: dict[tuple[str, str], list[float]]
+    fare_calendar: dict[tuple[str, str], list[float]]
+    agreement_counts: Counter[tuple[int, int]]
+    branch_segment_counts: Counter[tuple[str, int]]
+    overall_feature_counts: Counter[tuple[str, str]]
+    branch_segment_feature_counts: Counter[tuple[str, int, str, str]]
+
+    @classmethod
+    def create(cls) -> "AggregateAccumulator":
+        return cls(
+            route_stats=defaultdict(lambda: [0.0, 0.0]),
+            fare_calendar=defaultdict(lambda: [0.0, 0.0]),
+            agreement_counts=Counter(),
+            branch_segment_counts=Counter(),
+            overall_feature_counts=Counter(),
+            branch_segment_feature_counts=Counter(),
+        )
+
+
+def _runtime_device() -> str:
+    if torch.cuda.is_available():
+        return "cuda"
+    if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"
+
+
+def ensure_tabpfn_runtime() -> None:
+    os.environ.setdefault("TABPFN_DISABLE_TELEMETRY", "1")
+    os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
+    token = os.environ.get("HF_TOKEN")
+    if not token:
+        LOGGER.warning("HF_TOKEN is not set; TabPFN gated model download may fail")
+        return
+    try:
+        from huggingface_hub import login
+
+        login(token=token, add_to_git_credential=False, skip_if_logged_in=True)
+        LOGGER.info("Authenticated to Hugging Face for TabPFN runtime")
+    except TypeError:
+        login(token=token, add_to_git_credential=False)
+        LOGGER.info("Authenticated to Hugging Face for TabPFN runtime")
+
+
+def _tabpfn_regressor_model_path() -> str:
+    from tabpfn.model_loading import ModelSource, prepend_cache_path
+
+    return str(prepend_cache_path(ModelSource.get_regressor_v2_5().default_filename))
+
+
+def collapse_embeddings(raw: np.ndarray) -> np.ndarray:
+    embeddings = np.asarray(raw)
+    if embeddings.ndim == 3:
+        return embeddings.mean(axis=0).astype(np.float32, copy=False)
+    if embeddings.ndim == 2:
+        return embeddings.astype(np.float32, copy=False)
+    raise ValueError(f"Unexpected embedding shape: {embeddings.shape}")
+
+
+def _normalize_scalar(value: Any) -> Any:
+    if value is None or pd.isna(value):
+        return pd.NA
+    if isinstance(value, (datetime, date)):
+        return value.isoformat()
+    if isinstance(value, (dict, list, tuple, set)):
+        return json.dumps(value, sort_keys=True, default=str)
+    return value
+
+
+def infer_feature_contract(
+    frame: pd.DataFrame, config: DCOVisualizeConfig
+) -> tuple[list[str], dict[str, str], dict[str, str], list[str]]:
+    feature_columns: list[str] = []
+    feature_kinds: dict[str, str] = {}
     excluded_columns: dict[str, str] = {}
 
     for column in frame.columns:
-        if column in METADATA_COLUMNS:
+        if column in METADATA_COLUMNS or column == config.target_column:
+            continue
+        series = frame[column]
+        if series.dropna().empty:
+            excluded_columns[column] = "all_null"
+            continue
+        feature_columns.append(column)
+        if pd.api.types.is_numeric_dtype(series) and not pd.api.types.is_bool_dtype(series):
+            feature_kinds[column] = "numeric"
+        else:
+            feature_kinds[column] = "categorical"
+
+    hover_columns = [column for column in PREFERRED_HOVER_COLUMNS if column in frame.columns]
+    retained_columns = feature_columns + ([config.target_column] if config.target_column in frame.columns else [])
+    return feature_columns, feature_kinds, excluded_columns, hover_columns[: config.max_hover_columns]
+
+
+def prepare_feature_frame(
+    frame: pd.DataFrame, feature_columns: list[str], feature_kinds: dict[str, str]
+) -> pd.DataFrame:
+    normalized = pd.DataFrame(index=frame.index)
+    for column in feature_columns:
+        if column not in frame.columns:
+            if feature_kinds.get(column) == "numeric":
+                normalized[column] = pd.Series(np.nan, index=frame.index, dtype="float64")
+            else:
+                normalized[column] = pd.Series(pd.NA, index=frame.index, dtype="string")
             continue
 
         series = frame[column]
-        non_null = series.dropna()
-        if non_null.empty:
-            excluded_columns[column] = "all_null"
-            continue
+        if feature_kinds.get(column) == "numeric":
+            normalized[column] = pd.to_numeric(series, errors="coerce")
+        else:
+            normalized[column] = series.map(_normalize_scalar).astype("string")
+    return normalized
 
-        unique_count = int(non_null.nunique(dropna=True))
-        if unique_count <= 1:
-            excluded_columns[column] = "constant"
-            continue
 
-        if pd.api.types.is_bool_dtype(series):
-            boolean_columns.append(column)
-            continue
+def prepare_target(series: pd.Series) -> pd.Series:
+    return pd.to_numeric(series, errors="coerce")
 
-        if pd.api.types.is_numeric_dtype(series):
-            numeric_values = set(pd.Series(non_null).astype(str).str.lower().unique())
-            if numeric_values.issubset(TRUE_VALUES | FALSE_VALUES | {"1.0"}):
-                boolean_columns.append(column)
-            else:
-                numeric_columns.append(column)
-            continue
 
-        if _series_is_datetime(series, column, config):
-            datetime_columns.append(column)
-            continue
+def _category_indices(feature_columns: list[str], feature_kinds: dict[str, str]) -> list[int]:
+    return [index for index, column in enumerate(feature_columns) if feature_kinds[column] != "numeric"]
 
-        text = non_null.astype("string")
-        average_length = float(text.str.len().mean())
-        uniqueness_ratio = float(unique_count / len(non_null))
-        if uniqueness_ratio >= config.id_like_uniqueness_ratio and unique_count > 32:
-            excluded_columns[column] = "id_like"
-            continue
-        if average_length > config.long_text_threshold:
-            excluded_columns[column] = "long_text"
-            continue
-        categorical_columns.append(column)
 
-    retained_columns = [column for column in PREFERRED_CONTEXT_COLUMNS if column in frame.columns]
-    hover_columns = [column for column in PREFERRED_HOVER_COLUMNS if column in frame.columns]
-    money_columns = [column for column in numeric_columns if MONEY_LIKE_PATTERN.search(column)]
-    duration_columns = [column for column in numeric_columns if DURATION_PATTERN.search(column)]
-
-    return SchemaProfile(
-        numeric_columns=numeric_columns,
-        boolean_columns=boolean_columns,
-        categorical_columns=categorical_columns,
-        datetime_columns=datetime_columns,
-        excluded_columns=excluded_columns,
-        retained_columns=retained_columns,
-        hover_columns=hover_columns[: config.max_hover_columns],
-        money_columns=money_columns,
-        duration_columns=duration_columns,
+def _validation_split(
+    X: pd.DataFrame, y: pd.Series, random_seed: int
+) -> tuple[pd.DataFrame, pd.DataFrame | None, pd.Series, pd.Series | None]:
+    if len(X) < 64:
+        return X, None, y, None
+    X_train, X_val, y_train, y_val = train_test_split(
+        X,
+        y,
+        test_size=min(0.1, 5000 / max(len(X), 1)),
+        random_state=random_seed,
+    )
+    return (
+        X_train.reset_index(drop=True),
+        X_val.reset_index(drop=True),
+        y_train.reset_index(drop=True),
+        y_val.reset_index(drop=True),
     )
 
 
-def _clip_series(series: pd.Series, lower: float, upper: float) -> pd.Series:
-    clipped = series.copy()
-    clipped = clipped.clip(lower=lower, upper=upper)
-    return clipped
+def _prediction_metrics(
+    y_true: pd.Series | None, y_pred: np.ndarray | None
+) -> dict[str, float | None]:
+    if y_true is None or y_pred is None or len(y_true) == 0:
+        return {"rmse": None, "mae": None}
+    rmse = math.sqrt(mean_squared_error(y_true, y_pred))
+    mae = mean_absolute_error(y_true, y_pred)
+    return {"rmse": float(rmse), "mae": float(mae)}
 
 
-def _bucketize_numeric(series: pd.Series, edges: list[float]) -> pd.Series:
-    labels: list[str] = []
-    for left, right in zip(edges[:-1], edges[1:]):
-        labels.append(f"{int(left)}-{int(right)}")
-    bucketed = pd.cut(series, bins=edges, labels=labels, include_lowest=True)
-    return bucketed.astype("string").fillna("missing")
+def _fit_segmenter(embeddings: np.ndarray, config: DCOVisualizeConfig) -> SegmenterModel:
+    min_cluster_size = min(
+        max(16, len(embeddings) // 200),
+        max(config.hdbscan_min_cluster_size, 16),
+    )
+    min_cluster_size = max(16, min_cluster_size)
+    min_samples = min(config.hdbscan_min_samples, max(8, min_cluster_size // 4))
 
-
-def _great_circle_miles(lat1: pd.Series, lon1: pd.Series, lat2: pd.Series, lon2: pd.Series) -> pd.Series:
-    rad = math.pi / 180.0
-    lat1r = lat1 * rad
-    lon1r = lon1 * rad
-    lat2r = lat2 * rad
-    lon2r = lon2 * rad
-    dlat = lat2r - lat1r
-    dlon = lon2r - lon1r
-    hav = np.sin(dlat / 2.0) ** 2 + np.cos(lat1r) * np.cos(lat2r) * np.sin(dlon / 2.0) ** 2
-    return pd.Series(3958.7613 * (2.0 * np.arcsin(np.sqrt(np.clip(hav, 0, 1)))), index=lat1.index)
-
-
-class FTTransformerEncoder(nn.Module):
-    def __init__(
-        self,
-        numeric_count: int,
-        categorical_cardinalities: list[int],
-        d_model: int,
-        n_heads: int,
-        n_layers: int,
-        dropout: float,
-        embedding_dim: int,
-    ) -> None:
-        super().__init__()
-        self.numeric_count = numeric_count
-        self.categorical_cardinalities = categorical_cardinalities
-        self.cls_token = nn.Parameter(torch.zeros(1, 1, d_model))
-        self.numeric_weight = nn.Parameter(torch.randn(max(numeric_count, 1), d_model) * 0.02)
-        self.numeric_bias = nn.Parameter(torch.zeros(max(numeric_count, 1), d_model))
-        self.categorical_embeddings = nn.ModuleList(
-            [nn.Embedding(cardinality, d_model) for cardinality in categorical_cardinalities]
+    try:
+        clusterer = hdbscan.HDBSCAN(
+            min_cluster_size=min_cluster_size,
+            min_samples=min_samples,
+            metric="euclidean",
+            prediction_data=True,
         )
-        total_tokens = 1 + numeric_count + len(categorical_cardinalities)
-        self.feature_embedding = nn.Parameter(torch.randn(1, max(total_tokens, 1), d_model) * 0.02)
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=d_model,
-            nhead=n_heads,
-            dim_feedforward=d_model * 4,
-            dropout=dropout,
-            activation="gelu",
-            batch_first=True,
-            norm_first=True,
-        )
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
-        self.output_norm = nn.LayerNorm(d_model)
-        self.embedding_head = nn.Sequential(
-            nn.Linear(d_model, d_model),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(d_model, embedding_dim),
-        )
-        self.projection_head = nn.Sequential(
-            nn.Linear(embedding_dim, embedding_dim),
-            nn.GELU(),
-            nn.Linear(embedding_dim, embedding_dim),
-        )
-        self.numeric_heads = nn.ModuleList([nn.Linear(d_model, 1) for _ in range(numeric_count)])
-        self.categorical_heads = nn.ModuleList(
-            [nn.Linear(d_model, cardinality) for cardinality in categorical_cardinalities]
-        )
+        labels = clusterer.fit_predict(embeddings)
+        valid_labels = sorted(label for label in np.unique(labels) if label >= 0)
+        if len(valid_labels) >= 2:
+            return SegmenterModel(kind="hdbscan", model=clusterer, n_clusters=len(valid_labels))
+    except Exception:
+        pass
 
-    def forward(self, numeric: torch.Tensor, categorical: torch.Tensor) -> tuple[torch.Tensor, list[torch.Tensor], list[torch.Tensor]]:
-        batch_size = numeric.shape[0] if numeric.numel() else categorical.shape[0]
-        tokens: list[torch.Tensor] = [self.cls_token.expand(batch_size, -1, -1)]
-
-        if self.numeric_count:
-            numeric_tokens = numeric.unsqueeze(-1) * self.numeric_weight[: self.numeric_count]
-            numeric_tokens = numeric_tokens + self.numeric_bias[: self.numeric_count]
-            tokens.append(numeric_tokens)
-
-        if self.categorical_cardinalities:
-            categorical_tokens = torch.stack(
-                [embedding(categorical[:, index]) for index, embedding in enumerate(self.categorical_embeddings)],
-                dim=1,
-            )
-            tokens.append(categorical_tokens)
-
-        token_tensor = torch.cat(tokens, dim=1)
-        token_tensor = token_tensor + self.feature_embedding[:, : token_tensor.shape[1], :]
-        encoded = self.output_norm(self.transformer(token_tensor))
-        cls_embedding = self.embedding_head(encoded[:, 0, :])
-
-        numeric_reconstruction: list[torch.Tensor] = []
-        categorical_reconstruction: list[torch.Tensor] = []
-        offset = 1
-        if self.numeric_count:
-            numeric_tokens = encoded[:, offset : offset + self.numeric_count, :]
-            numeric_reconstruction = [
-                head(numeric_tokens[:, index, :]).squeeze(-1) for index, head in enumerate(self.numeric_heads)
-            ]
-            offset += self.numeric_count
-        if self.categorical_cardinalities:
-            categorical_tokens = encoded[:, offset : offset + len(self.categorical_cardinalities), :]
-            categorical_reconstruction = [
-                head(categorical_tokens[:, index, :]) for index, head in enumerate(self.categorical_heads)
-            ]
-        return cls_embedding, numeric_reconstruction, categorical_reconstruction
-
-    def project(self, embeddings: torch.Tensor) -> torch.Tensor:
-        return self.projection_head(embeddings)
+    kmeans_clusters = min(8, max(2, len(embeddings) // 4_000))
+    clusterer = MiniBatchKMeans(n_clusters=kmeans_clusters, random_state=config.random_seed)
+    clusterer.fit(embeddings)
+    return SegmenterModel(kind="kmeans", model=clusterer, n_clusters=kmeans_clusters)
 
 
-class AggregateCollector:
-    def __init__(self) -> None:
-        self.flow_stats: dict[tuple[str, str], dict[str, float]] = defaultdict(lambda: {"count": 0, "sum_log_price": 0.0, "sum_price": 0.0})
-        self.calendar_stats: dict[tuple[str, str, str], dict[str, float]] = defaultdict(lambda: {"count": 0, "sum_log_price": 0.0, "sum_price": 0.0})
-        self.fingerprint_counts: Counter[tuple[int, str, str]] = Counter()
-        self.global_feature_counts: Counter[tuple[str, str]] = Counter()
-        self.segment_sizes: Counter[int] = Counter()
+def _fit_layout(
+    embeddings: np.ndarray, config: DCOVisualizeConfig
+) -> tuple[Any, np.ndarray, ProjectionSpec, float]:
+    if len(embeddings) < 3:
+        coords = np.zeros((len(embeddings), 2), dtype=np.float32)
+        projection = ProjectionSpec(name="umap", params={"n_neighbors": 2, "min_dist": config.umap_min_dist})
+        return None, coords, projection, 1.0
 
-    def update(self, frame: pd.DataFrame) -> None:
-        working = frame.copy()
-        if "price_inc" in working.columns:
-            price = pd.to_numeric(working["price_inc"], errors="coerce")
-        else:
-            price = pd.Series(np.nan, index=working.index)
-        price = price.fillna(0.0)
-        log_price = np.log1p(np.clip(price, 0, None))
-        working["__price"] = price
-        working["__log_price"] = log_price
+    n_neighbors = min(config.umap_neighbors, max(2, len(embeddings) - 1))
+    reducer = umap.UMAP(
+        n_components=2,
+        metric="cosine",
+        n_neighbors=n_neighbors,
+        min_dist=config.umap_min_dist,
+        densmap=True,
+        random_state=config.random_seed,
+    )
+    coords = reducer.fit_transform(embeddings).astype(np.float32, copy=False)
+    trust_neighbors = max(1, min(10, (len(embeddings) - 1) // 2))
+    score = float(trustworthiness(embeddings, coords, n_neighbors=trust_neighbors))
+    projection = ProjectionSpec(
+        name="densmap",
+        params={"n_neighbors": n_neighbors, "min_dist": config.umap_min_dist, "metric": "cosine"},
+    )
+    return reducer, coords, projection, score
 
-        if {"origin_metro", "destination_metro"} <= set(working.columns):
-            grouped = (
-                working.groupby(["origin_metro", "destination_metro"], dropna=False)
-                .agg(count=("row_id", "size"), sum_log_price=("__log_price", "sum"), sum_price=("__price", "sum"))
-                .reset_index()
-            )
-            for row in grouped.itertuples(index=False):
-                key = (str(row.origin_metro), str(row.destination_metro))
-                stats = self.flow_stats[key]
-                stats["count"] += int(row.count)
-                stats["sum_log_price"] += float(row.sum_log_price)
-                stats["sum_price"] += float(row.sum_price)
 
-        if "outbound_departure_date" in working.columns:
-            dep_dates = pd.to_datetime(working["outbound_departure_date"], errors="coerce")
-            working["dep_date_key"] = dep_dates.dt.date.astype("string").fillna("missing")
-            if "advance_purchase" in working.columns:
-                ap = pd.to_numeric(working["advance_purchase"], errors="coerce")
-                working["advance_bucket_key"] = _bucketize_numeric(ap, [0, 7, 14, 30, 60, 90, 180, 400])
-                grouped = (
-                    working.groupby(["dep_date_key", "advance_bucket_key"], dropna=False)
-                    .agg(count=("row_id", "size"), sum_log_price=("__log_price", "sum"), sum_price=("__price", "sum"))
-                    .reset_index()
-                )
-                for row in grouped.itertuples(index=False):
-                    key = (str(row.dep_date_key), str(row.advance_bucket_key), "advance_purchase")
-                    stats = self.calendar_stats[key]
-                    stats["count"] += int(row.count)
-                    stats["sum_log_price"] += float(row.sum_log_price)
-                    stats["sum_price"] += float(row.sum_price)
-            if "return_gap_bucket" in working.columns:
-                rt = working[working["return_gap_bucket"].notna() & (working["return_gap_bucket"].astype("string") != "missing")].copy()
-                if not rt.empty:
-                    grouped = (
-                        rt.groupby(["dep_date_key", "return_gap_bucket"], dropna=False)
-                        .agg(count=("row_id", "size"), sum_log_price=("__log_price", "sum"), sum_price=("__price", "sum"))
-                        .reset_index()
-                    )
-                    for row in grouped.itertuples(index=False):
-                        key = (str(row.dep_date_key), str(row.return_gap_bucket), "return_gap")
-                        stats = self.calendar_stats[key]
-                        stats["count"] += int(row.count)
-                        stats["sum_log_price"] += float(row.sum_log_price)
-                        stats["sum_price"] += float(row.sum_price)
+def _fit_pretrained_branch(
+    X_train: pd.DataFrame,
+    y_train: pd.Series,
+    X_val: pd.DataFrame | None,
+    y_val: pd.Series | None,
+    categorical_feature_indices: list[int],
+    config: DCOVisualizeConfig,
+) -> BranchState:
+    from tabpfn import TabPFNRegressor
+    from tabpfn.constants import ModelVersion
 
-        if "segment_id" in working.columns:
-            segment_counts = working["segment_id"].value_counts(dropna=False).to_dict()
-            for segment_id, count in segment_counts.items():
-                self.segment_sizes[int(segment_id)] += int(count)
+    device = _runtime_device()
+    LOGGER.info(
+        "Fitting pretrained TabPFN branch on device=%s train_rows=%d val_rows=%d categorical_features=%d",
+        device,
+        len(X_train),
+        0 if X_val is None else len(X_val),
+        len(categorical_feature_indices),
+    )
+    model = TabPFNRegressor.create_default_for_version(
+        ModelVersion.V2_5,
+        categorical_features_indices=categorical_feature_indices,
+        device=device,
+        fit_mode=config.pretrained_fit_mode,
+        n_estimators=config.pretrained_n_estimators,
+        random_state=config.random_seed,
+        ignore_pretraining_limits=True,
+    )
+    model.fit(X_train, y_train)
+    y_pred = None if X_val is None else model.predict(X_val)
+    train_embeddings = model.get_embeddings(X_train, data_source="train")
+    collapsed = collapse_embeddings(train_embeddings)
+    LOGGER.info(
+        "Pretrained branch fit complete: embedding_dim=%d rmse=%s mae=%s",
+        collapsed.shape[1],
+        _prediction_metrics(y_val, y_pred)["rmse"],
+        _prediction_metrics(y_val, y_pred)["mae"],
+    )
+    metrics = _prediction_metrics(y_val, y_pred)
+    return BranchState(
+        name="pretrained",
+        model=model,
+        embedding_model=model,
+        segmenter=_fit_segmenter(collapsed, config),
+        embedding_dim=int(collapsed.shape[1]),
+        prediction_metrics={
+            "device": device,
+            "n_estimators": config.pretrained_n_estimators,
+            "version": config.tabpfn_version,
+            **metrics,
+        },
+    )
+
+
+def _fit_finetuned_branch(
+    X_train: pd.DataFrame,
+    y_train: pd.Series,
+    X_val: pd.DataFrame | None,
+    y_val: pd.Series | None,
+    categorical_feature_indices: list[int],
+    config: DCOVisualizeConfig,
+) -> BranchState:
+    from tabpfn.finetuning import FinetunedTabPFNRegressor
+
+    device = _runtime_device()
+    LOGGER.info(
+        "Fitting fine-tuned TabPFN branch on device=%s train_rows=%d val_rows=%d epochs=%d",
+        device,
+        len(X_train),
+        0 if X_val is None else len(X_val),
+        config.finetune_epochs,
+    )
+    model = FinetunedTabPFNRegressor(
+        device=device,
+        epochs=config.finetune_epochs,
+        learning_rate=config.finetune_learning_rate,
+        weight_decay=config.finetune_weight_decay,
+        validation_split_ratio=config.finetune_validation_split_ratio,
+        n_finetune_ctx_plus_query_samples=config.finetune_ctx_plus_query_samples,
+        finetune_ctx_query_split_ratio=config.finetune_ctx_query_split_ratio,
+        n_inference_subsample_samples=config.finetune_inference_subsample_samples,
+        random_state=config.random_seed,
+        early_stopping_patience=config.finetune_early_stopping_patience,
+        min_delta=config.finetune_min_delta,
+        n_estimators_final_inference=config.finetuned_n_estimators,
+        save_checkpoint_interval=None,
+        extra_regressor_kwargs={
+            "model_path": _tabpfn_regressor_model_path(),
+            "categorical_features_indices": categorical_feature_indices,
+        },
+    )
+    model.fit(X_train, y_train, X_val=X_val, y_val=y_val)
+    embedding_model = model.finetuned_inference_regressor_
+    y_pred = None if X_val is None else model.predict(X_val)
+    train_embeddings = embedding_model.get_embeddings(X_train, data_source="train")
+    collapsed = collapse_embeddings(train_embeddings)
+    LOGGER.info(
+        "Fine-tuned branch fit complete: embedding_dim=%d rmse=%s mae=%s",
+        collapsed.shape[1],
+        _prediction_metrics(y_val, y_pred)["rmse"],
+        _prediction_metrics(y_val, y_pred)["mae"],
+    )
+    metrics = _prediction_metrics(y_val, y_pred)
+    return BranchState(
+        name="finetuned",
+        model=model,
+        embedding_model=embedding_model,
+        segmenter=_fit_segmenter(collapsed, config),
+        embedding_dim=int(collapsed.shape[1]),
+        prediction_metrics={
+            "device": device,
+            "epochs": config.finetune_epochs,
+            "n_estimators_final_inference": config.finetuned_n_estimators,
+            "version": config.tabpfn_version,
+            **metrics,
+        },
+    )
+
+
+def fit_embedding_model(frame: pd.DataFrame, config: DCOVisualizeConfig) -> FitResult:
+    ensure_tabpfn_runtime()
+    feature_columns, feature_kinds, excluded_columns, hover_columns = infer_feature_contract(frame, config)
+    LOGGER.info(
+        "Preparing TabPFN fit: input_rows=%d features=%d excluded=%d target=%s",
+        len(frame),
+        len(feature_columns),
+        len(excluded_columns),
+        config.target_column,
+    )
+    if config.target_column not in frame.columns:
+        raise ValueError(f"Target column {config.target_column!r} is missing from the training frame.")
+
+    trainable = frame.dropna(subset=[config.target_column]).reset_index(drop=True)
+    if trainable.empty:
+        raise ValueError(f"Target column {config.target_column!r} has no non-null values.")
+
+    X_full = prepare_feature_frame(trainable, feature_columns, feature_kinds)
+    y_full = prepare_target(trainable[config.target_column])
+    valid_mask = y_full.notna()
+    X_full = X_full.loc[valid_mask].reset_index(drop=True)
+    y_full = y_full.loc[valid_mask].reset_index(drop=True)
+    if X_full.empty:
+        raise ValueError(f"Target column {config.target_column!r} has no numeric values after normalization.")
+
+    X_train, X_val, y_train, y_val = _validation_split(X_full, y_full, config.random_seed)
+    categorical_feature_indices = _category_indices(feature_columns, feature_kinds)
+    LOGGER.info(
+        "Normalized fit data: train_rows=%d val_rows=%d numeric_features=%d categorical_features=%d",
+        len(X_train),
+        0 if X_val is None else len(X_val),
+        sum(1 for kind in feature_kinds.values() if kind == "numeric"),
+        len(categorical_feature_indices),
+    )
+
+    pretrained = _fit_pretrained_branch(
+        X_train=X_train,
+        y_train=y_train,
+        X_val=X_val,
+        y_val=y_val,
+        categorical_feature_indices=categorical_feature_indices,
+        config=config,
+    )
+    finetuned = _fit_finetuned_branch(
+        X_train=X_train,
+        y_train=y_train,
+        X_val=X_val,
+        y_val=y_val,
+        categorical_feature_indices=categorical_feature_indices,
+        config=config,
+    )
+
+    route_source_column = next(
+        (column for column in [config.route_source_column, "origin_city", "origin"] if column in frame.columns),
+        "origin",
+    )
+    route_destination_column = next(
+        (column for column in [config.route_destination_column, "destination_city", "destination"] if column in frame.columns),
+        "destination",
+    )
+    departure_date_column = next(
+        (column for column in [config.departure_date_column, "departure_date"] if column in frame.columns),
+        config.departure_date_column,
+    )
+    advance_purchase_column = (
+        config.advance_purchase_column if config.advance_purchase_column in frame.columns else config.advance_purchase_column
+    )
+    return_date_column = (
+        config.return_date_column if config.return_date_column in frame.columns else config.return_date_column
+    )
+
+    model = TabPFNEmbeddingModel(
+        config=config,
+        target_column=config.target_column,
+        feature_columns=feature_columns,
+        feature_kinds=feature_kinds,
+        categorical_feature_indices=categorical_feature_indices,
+        excluded_columns=excluded_columns,
+        retained_columns=feature_columns + [config.target_column],
+        hover_columns=hover_columns,
+        pretrained=pretrained,
+        finetuned=finetuned,
+        route_source_column=route_source_column,
+        route_destination_column=route_destination_column,
+        departure_date_column=departure_date_column,
+        advance_purchase_column=advance_purchase_column,
+        return_date_column=return_date_column,
+    )
+    metrics = {
+        "encoder_backend": "tabpfn_2_5",
+        "embedding_extraction": "direct_get_embeddings",
+        "target_column": config.target_column,
+        "tabpfn_version": config.tabpfn_version,
+        "pretrained_embedding_dim": pretrained.embedding_dim,
+        "finetuned_embedding_dim": finetuned.embedding_dim,
+        "feature_columns": feature_columns,
+        "excluded_columns": excluded_columns,
+        "retained_columns": model.retained_columns,
+        "hover_columns": model.hover_columns,
+        "pretrained": pretrained.prediction_metrics,
+        "finetuned": finetuned.prediction_metrics,
+    }
+    LOGGER.info(
+        "Completed TabPFN fit: pretrained_dim=%d finetuned_dim=%d",
+        pretrained.embedding_dim,
+        finetuned.embedding_dim,
+    )
+    return FitResult(model=model, metrics=metrics)
+
+
+def _append_embedding_columns(frame: pd.DataFrame, prefix: str, embeddings: np.ndarray) -> None:
+    for index in range(embeddings.shape[1]):
+        frame[f"{prefix}_{index:03d}"] = embeddings[:, index]
+
+
+def _route_key(row: pd.Series, source_column: str, destination_column: str) -> tuple[str, str]:
+    source = str(row.get(source_column) or row.get("origin") or "unknown")
+    destination = str(row.get(destination_column) or row.get("destination") or "unknown")
+    return source, destination
+
+
+def _advance_purchase_bucket(value: Any) -> str:
+    numeric = pd.to_numeric(pd.Series([value]), errors="coerce").iloc[0]
+    if pd.isna(numeric):
+        return "missing"
+    if numeric <= 3:
+        return "0-3"
+    if numeric <= 7:
+        return "4-7"
+    if numeric <= 14:
+        return "8-14"
+    if numeric <= 30:
+        return "15-30"
+    if numeric <= 60:
+        return "31-60"
+    if numeric <= 90:
+        return "61-90"
+    return "91+"
+
+
+def _prepare_departure_value(value: Any) -> str:
+    if value is None or pd.isna(value):
+        return "missing"
+    return str(_normalize_scalar(value))
+
+
+def transform_frame(model: TabPFNEmbeddingModel, frame: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, Any]]:
+    features = prepare_feature_frame(frame, model.feature_columns, model.feature_kinds)
+    transformed = frame.copy()
+
+    pretrained_embeddings = model.pretrained.get_embeddings(features, data_source="test")
+    finetuned_embeddings = model.finetuned.get_embeddings(features, data_source="test")
+
+    _append_embedding_columns(transformed, "pretrained_emb", pretrained_embeddings)
+    _append_embedding_columns(transformed, "finetuned_emb", finetuned_embeddings)
+
+    transformed["pretrained_segment_id"] = model.pretrained.segmenter.predict(pretrained_embeddings)
+    transformed["finetuned_segment_id"] = model.finetuned.segmenter.predict(finetuned_embeddings)
+    transformed["pretrained_price_pred"] = model.pretrained.predict(features)
+    transformed["finetuned_price_pred"] = model.finetuned.predict(features)
+
+    if model.target_column in transformed.columns:
+        actual = prepare_target(transformed[model.target_column])
+        transformed["pretrained_abs_error"] = (transformed["pretrained_price_pred"] - actual).abs()
+        transformed["finetuned_abs_error"] = (transformed["finetuned_price_pred"] - actual).abs()
+    else:
+        transformed["pretrained_abs_error"] = np.nan
+        transformed["finetuned_abs_error"] = np.nan
+    transformed["price_prediction_gap"] = (
+        transformed["pretrained_price_pred"] - transformed["finetuned_price_pred"]
+    ).abs()
+
+    metrics = {
+        "rows": int(len(transformed)),
+        "pretrained_embedding_dim": int(pretrained_embeddings.shape[1]),
+        "finetuned_embedding_dim": int(finetuned_embeddings.shape[1]),
+    }
+    return transformed, metrics
+
+
+def _update_aggregates(
+    accumulator: AggregateAccumulator, frame: pd.DataFrame, model: TabPFNEmbeddingModel
+) -> None:
+    price_series = prepare_target(frame[model.target_column]) if model.target_column in frame.columns else pd.Series(
+        np.nan, index=frame.index
+    )
+    route_source = model.route_source_column if model.route_source_column in frame.columns else "origin"
+    route_destination = model.route_destination_column if model.route_destination_column in frame.columns else "destination"
+    departure_column = (
+        model.departure_date_column if model.departure_date_column in frame.columns else model.departure_date_column
+    )
+
+    working = frame.copy()
+    working["_route_source"] = working[route_source].astype("string").fillna("missing")
+    working["_route_destination"] = working[route_destination].astype("string").fillna("missing")
+    working["_departure_value"] = working[departure_column].map(_prepare_departure_value)
+    working["_advance_bucket"] = (
+        working[model.advance_purchase_column].map(_advance_purchase_bucket)
+        if model.advance_purchase_column in working.columns
+        else "missing"
+    )
+    working["_price_value"] = price_series
+
+    route_group = (
+        working.groupby(["_route_source", "_route_destination"], dropna=False)["_price_value"]
+        .agg(["count", "sum"])
+        .reset_index()
+    )
+    for source, destination, count, total_price in route_group.itertuples(index=False, name=None):
+        stats = accumulator.route_stats[(str(source), str(destination))]
+        stats[0] += float(count)
+        stats[1] += float(total_price) if not pd.isna(total_price) else 0.0
+
+    calendar_group = (
+        working.groupby(["_departure_value", "_advance_bucket"], dropna=False)["_price_value"]
+        .agg(["count", "sum"])
+        .reset_index()
+    )
+    for departure_value, advance_bucket, count, total_price in calendar_group.itertuples(index=False, name=None):
+        stats = accumulator.fare_calendar[(str(departure_value), str(advance_bucket))]
+        stats[0] += float(count)
+        stats[1] += float(total_price) if not pd.isna(total_price) else 0.0
+
+    agreement_group = (
+        working.groupby(["pretrained_segment_id", "finetuned_segment_id"], dropna=False)
+        .size()
+        .reset_index(name="count")
+    )
+    for row in agreement_group.itertuples(index=False):
+        accumulator.agreement_counts[(int(row.pretrained_segment_id), int(row.finetuned_segment_id))] += int(row.count)
+
+    for branch, segment_column in [("pretrained", "pretrained_segment_id"), ("finetuned", "finetuned_segment_id")]:
+        segment_group = working.groupby(segment_column, dropna=False).size().reset_index(name="count")
+        for row in segment_group.itertuples(index=False):
+            accumulator.branch_segment_counts[(branch, int(getattr(row, segment_column)))] += int(row.count)
 
         for feature in FINGERPRINT_FEATURES:
             if feature not in working.columns:
                 continue
-            normalized = working[feature].astype("string").fillna("missing")
-            top_values = normalized.value_counts().head(24).index
-            normalized = np.where(normalized.isin(top_values), normalized, "other")
-            for value in normalized:
-                self.global_feature_counts[(feature, str(value))] += 1
-            if "segment_id" not in working.columns:
-                continue
-            grouped = (
-                pd.DataFrame({"segment_id": working["segment_id"].astype(int), feature: normalized})
-                .groupby(["segment_id", feature], dropna=False)
+            values = working[feature].astype("string").fillna("missing")
+            overall_group = values.value_counts(dropna=False)
+            for value, count in overall_group.items():
+                accumulator.overall_feature_counts[(feature, str(value))] += int(count)
+
+            fingerprint_group = (
+                pd.DataFrame({"segment": working[segment_column], "value": values})
+                .groupby(["segment", "value"], dropna=False)
                 .size()
-                .rename("count")
-                .reset_index()
+                .reset_index(name="count")
             )
-            for row in grouped.itertuples(index=False):
-                self.fingerprint_counts[(int(row.segment_id), feature, str(getattr(row, feature)))] += int(row.count)
+            for row in fingerprint_group.itertuples(index=False):
+                accumulator.branch_segment_feature_counts[
+                    (branch, int(row.segment), feature, str(row.value))
+                ] += int(row.count)
 
-    def to_frame(self) -> pd.DataFrame:
-        records: list[AggregateRecord] = []
-        for (origin_metro, destination_metro), stats in sorted(self.flow_stats.items()):
-            mean_log_price = stats["sum_log_price"] / max(stats["count"], 1)
-            mean_price = stats["sum_price"] / max(stats["count"], 1)
-            records.append(
-                AggregateRecord(
-                    view="metro_flow",
-                    key_1=origin_metro,
-                    key_2=destination_metro,
-                    key_3=None,
-                    segment_id=None,
-                    count=int(stats["count"]),
-                    mean_log_price=float(mean_log_price),
-                    mean_price=float(mean_price),
-                    value=None,
-                )
+
+def _collect_viz_rows(
+    frame: pd.DataFrame,
+    global_indices: np.ndarray,
+    batch_start: int,
+    batch_end: int,
+) -> pd.DataFrame:
+    if len(global_indices) == 0:
+        return frame.iloc[0:0].copy()
+    left = int(np.searchsorted(global_indices, batch_start, side="left"))
+    right = int(np.searchsorted(global_indices, batch_end, side="left"))
+    if right <= left:
+        return frame.iloc[0:0].copy()
+    local_indices = global_indices[left:right] - batch_start
+    return frame.iloc[local_indices].copy().reset_index(drop=True)
+
+
+def _finalize_aggregate_frame(
+    accumulator: AggregateAccumulator, model: TabPFNEmbeddingModel, total_rows: int
+) -> pd.DataFrame:
+    records: list[AggregateRecord] = []
+
+    for (source, destination), (count, total_price) in accumulator.route_stats.items():
+        mean_price = (total_price / count) if count else None
+        records.append(
+            AggregateRecord(
+                view="route_network",
+                branch=None,
+                key_1=source,
+                key_2=destination,
+                key_3=None,
+                segment_id=None,
+                count=int(count),
+                mean_price=float(mean_price) if mean_price is not None else None,
+                value=None,
             )
-
-        for (dep_date, bucket, bucket_type), stats in sorted(self.calendar_stats.items()):
-            mean_log_price = stats["sum_log_price"] / max(stats["count"], 1)
-            mean_price = stats["sum_price"] / max(stats["count"], 1)
-            records.append(
-                AggregateRecord(
-                    view="fare_calendar",
-                    key_1=dep_date,
-                    key_2=bucket,
-                    key_3=bucket_type,
-                    segment_id=None,
-                    count=int(stats["count"]),
-                    mean_log_price=float(mean_log_price),
-                    mean_price=float(mean_price),
-                    value=None,
-                )
-            )
-
-        total_rows = max(sum(self.segment_sizes.values()), 1)
-        for segment_id, segment_total in sorted(self.segment_sizes.items()):
-            records.append(
-                AggregateRecord(
-                    view="segment_size",
-                    key_1=None,
-                    key_2=None,
-                    key_3=None,
-                    segment_id=int(segment_id),
-                    count=int(segment_total),
-                    mean_log_price=None,
-                    mean_price=None,
-                    value=None,
-                )
-            )
-            feature_values = {
-                (feature, value)
-                for label, feature, value in self.fingerprint_counts
-                if label == segment_id
-            }
-            for feature, value in feature_values:
-                count = self.fingerprint_counts[(segment_id, feature, value)]
-                global_count = self.global_feature_counts[(feature, value)]
-                segment_share = count / max(segment_total, 1)
-                global_share = global_count / total_rows
-                lift = math.log2((segment_share + EPSILON) / (global_share + EPSILON))
-                records.append(
-                    AggregateRecord(
-                        view="segment_fingerprint",
-                        key_1=feature,
-                        key_2=value,
-                        key_3=None,
-                        segment_id=int(segment_id),
-                        count=int(count),
-                        mean_log_price=None,
-                        mean_price=None,
-                        value=float(lift),
-                    )
-                )
-
-        return pd.DataFrame([asdict(record) for record in records])
-
-
-class TabularEmbeddingModel:
-    def __init__(self, config: DCOVisualizeConfig) -> None:
-        self.config = config
-        self.schema: SchemaProfile | None = None
-        self.numeric_feature_names: list[str] = []
-        self.categorical_feature_names: list[str] = []
-        self.numeric_centers: dict[str, float] = {}
-        self.numeric_scales: dict[str, float] = {}
-        self.raw_winsorization: dict[str, tuple[float, float]] = {}
-        self.categorical_vocabularies: dict[str, dict[str, int]] = {}
-        self.encoder: FTTransformerEncoder | None = None
-        self.encoder_device: str = "cpu"
-        self.segmenter: Any | None = None
-        self.segmenter_kind: str = self.config.segment_method
-        self.projector: Any | None = None
-        self.projection_spec: ProjectionSpec | None = None
-        self.cluster_count: int | None = None
-        self.noise_fraction: float = 0.0
-        self.geocode_coverage: dict[str, float] = {}
-        self.train_loss_history: list[dict[str, float]] = []
-
-    def fit(self, frame: pd.DataFrame) -> dict[str, Any]:
-        self.schema = infer_schema(frame, self.config)
-        numeric_frame, categorical_frame, engineered = self._build_feature_frames(frame, fit=True)
-        numeric_array, categorical_array = self._fit_preprocessor(numeric_frame, categorical_frame)
-        self._fit_encoder(numeric_array, categorical_array)
-        embeddings = self._encode_embeddings(numeric_array, categorical_array)
-        labels = self._fit_segmenter(embeddings)
-        metrics = self._build_metrics(engineered, embeddings, labels)
-        return metrics
-
-    def transform(self, frame: pd.DataFrame) -> tuple[pd.DataFrame, np.ndarray]:
-        if self.schema is None or self.encoder is None:
-            raise ValueError("Model must be fitted before transform().")
-        numeric_frame, categorical_frame, engineered = self._build_feature_frames(frame, fit=False)
-        numeric_array, categorical_array = self._transform_preprocessor(numeric_frame, categorical_frame)
-        embeddings = self._encode_embeddings(numeric_array, categorical_array)
-        labels = self._predict_segments(embeddings)
-        transformed = self._assemble_output_frame(frame, engineered, embeddings, labels)
-        return transformed, embeddings
-
-    def project_visualization_sample(self, frame: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, Any]]:
-        if frame.empty:
-            raise ValueError("Visualization frame is empty.")
-        embedding_columns = [column for column in frame.columns if column.startswith("embedding_")]
-        if not embedding_columns:
-            raise ValueError("Visualization frame does not contain embedding columns.")
-        embeddings = frame[embedding_columns].to_numpy(dtype=np.float32, copy=False)
-        neighbors = max(2, min(45, max(10, len(frame) // 200), len(frame) - 1))
-        reducer = umap.UMAP(
-            n_components=2,
-            metric="cosine",
-            densmap=True,
-            n_neighbors=neighbors,
-            min_dist=0.05,
-            random_state=self.config.random_seed,
-            transform_seed=self.config.random_seed,
         )
-        coordinates = reducer.fit_transform(embeddings)
-        result = frame.copy()
-        result["layout_x"] = coordinates[:, 0]
-        result["layout_y"] = coordinates[:, 1]
-        result["layout_method"] = "densmap"
-        self.projector = reducer
-        self.projection_spec = ProjectionSpec(
-            name="densmap",
-            params={
-                "metric": "cosine",
-                "n_neighbors": int(neighbors),
-                "min_dist": 0.05,
-                "densmap": True,
-            },
-        )
-        trust = None
-        if len(frame) > 10:
-            try:
-                trust = float(trustworthiness(embeddings, coordinates, n_neighbors=min(10, len(frame) - 1)))
-            except Exception:
-                trust = None
-        return result, {
-            "projection": {"name": "densmap", "metric": "cosine", "n_neighbors": int(neighbors), "min_dist": 0.05},
-            "projection_trustworthiness": trust,
-        }
-
-    def _build_feature_frames(self, frame: pd.DataFrame, fit: bool) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-        assert self.schema is not None
-        working = frame.copy()
-        lookup = load_city_lookup()
-        code_to_country = lookup.set_index("code")["country"].to_dict()
-        code_to_lat = lookup.set_index("code")["latitude"].to_dict()
-        code_to_lon = lookup.set_index("code")["longitude"].to_dict()
-
-        if "origin_metro" in working.columns:
-            working["origin_latitude"] = working["origin_metro"].astype("string").map(code_to_lat)
-            working["origin_longitude"] = working["origin_metro"].astype("string").map(code_to_lon)
-        if "destination_metro" in working.columns:
-            working["destination_latitude"] = working["destination_metro"].astype("string").map(code_to_lat)
-            working["destination_longitude"] = working["destination_metro"].astype("string").map(code_to_lon)
-
-        for column in ("origin_country", "destination_country"):
-            if column in working.columns:
-                continue
-            metro_column = "origin_metro" if column.startswith("origin") else "destination_metro"
-            if metro_column in working.columns:
-                working[column] = working[metro_column].astype("string").map(code_to_country)
-
-        if "outbound_gcm" in working.columns:
-            gcm = pd.to_numeric(working["outbound_gcm"], errors="coerce")
-        elif {"origin_latitude", "origin_longitude", "destination_latitude", "destination_longitude"} <= set(working.columns):
-            gcm = _great_circle_miles(
-                pd.to_numeric(working["origin_latitude"], errors="coerce"),
-                pd.to_numeric(working["origin_longitude"], errors="coerce"),
-                pd.to_numeric(working["destination_latitude"], errors="coerce"),
-                pd.to_numeric(working["destination_longitude"], errors="coerce"),
+        records.append(
+            AggregateRecord(
+                view="market_matrix",
+                branch=None,
+                key_1=source,
+                key_2=destination,
+                key_3=None,
+                segment_id=None,
+                count=int(count),
+                mean_price=float(mean_price) if mean_price is not None else None,
+                value=None,
             )
-        else:
-            gcm = pd.Series(np.nan, index=working.index)
-        working["route_great_circle_miles"] = gcm
-
-        origin_market = None
-        destination_market = None
-        for preferred in ("origin_metro", "origin_city", "origin"):
-            if preferred in working.columns:
-                origin_market = working[preferred].astype("string")
-                break
-        for preferred in ("destination_metro", "destination_city", "destination"):
-            if preferred in working.columns:
-                destination_market = working[preferred].astype("string")
-                break
-        if origin_market is not None and destination_market is not None:
-            working["market_token"] = origin_market.fillna("missing") + "->" + destination_market.fillna("missing")
-        else:
-            working["market_token"] = "missing"
-
-        if {"origin_country", "destination_country"} <= set(working.columns):
-            working["domestic_flag"] = (
-                working["origin_country"].astype("string").fillna("missing")
-                == working["destination_country"].astype("string").fillna("missing")
-            ).astype("float32")
-        else:
-            working["domestic_flag"] = np.nan
-
-        outbound_source = (
-            working["outbound_departure_date"]
-            if "outbound_departure_date" in working.columns
-            else pd.Series(pd.NaT, index=working.index)
-        )
-        inbound_source = (
-            working["inbound_departure_date"]
-            if "inbound_departure_date" in working.columns
-            else pd.Series(pd.NaT, index=working.index)
-        )
-        outbound_departure = pd.to_datetime(outbound_source, errors="coerce", utc=True)
-        inbound_departure = pd.to_datetime(inbound_source, errors="coerce", utc=True)
-        sale_timestamp = pd.Timestamp(self.config.sales_date, tz="UTC")
-        working["outbound_days_from_sale"] = (outbound_departure - sale_timestamp).dt.total_seconds() / 86_400.0
-        working["return_gap_days"] = (inbound_departure - outbound_departure).dt.total_seconds() / 86_400.0
-        working["is_round_trip"] = (
-            working.get("trip_type", pd.Series("", index=working.index)).astype("string").fillna("") == "RT"
-        ).astype("float32")
-        working["return_gap_bucket"] = _bucketize_numeric(
-            pd.to_numeric(working["return_gap_days"], errors="coerce"),
-            [0, 1, 3, 7, 14, 21, 30, 60, 400],
         )
 
-        geocode_fields = {
-            "origin_metro": working.get("origin_metro"),
-            "destination_metro": working.get("destination_metro"),
-            "origin_city": working.get("origin_city"),
-            "destination_city": working.get("destination_city"),
-        }
-        if fit:
-            self.geocode_coverage = {}
-            for name, series in geocode_fields.items():
-                if series is None:
-                    continue
-                non_null = series.astype("string").dropna()
-                if non_null.empty:
-                    self.geocode_coverage[name] = 0.0
-                else:
-                    self.geocode_coverage[name] = float(non_null.isin(lookup["code"]).mean())
-
-        numeric = pd.DataFrame(index=working.index)
-        categorical = pd.DataFrame(index=working.index)
-
-        for column in self.schema.numeric_columns:
-            series = pd.to_numeric(working[column], errors="coerce")
-            if column == "length_of_stay":
-                numeric["length_of_stay_days"] = series.mask(series < 0)
-                numeric["is_one_way_stay_sentinel"] = series.lt(0).astype("float32")
-                continue
-            if MONEY_LIKE_PATTERN.search(column):
-                if fit:
-                    lower = float(series.quantile(0.001))
-                    upper = float(series.quantile(0.999))
-                    self.raw_winsorization[column] = (lower, upper)
-                lower, upper = self.raw_winsorization.get(column, (float(series.min()), float(series.max())))
-                clipped = _clip_series(series, lower, upper)
-                numeric[f"log1p_{column}"] = np.log1p(np.clip(clipped, 0, None))
-                continue
-            if DURATION_PATTERN.search(column):
-                numeric[f"log1p_{column}"] = np.log1p(np.clip(series, 0, None))
-                continue
-            numeric[column] = series
-
-        for column in self.schema.boolean_columns:
-            numeric[column] = _coerce_boolean(working[column])
-
-        for column in self.schema.datetime_columns:
-            parsed = pd.to_datetime(working[column], errors="coerce", utc=True)
-            numeric[f"{column}__days_from_sale"] = (parsed - sale_timestamp).dt.total_seconds() / 86_400.0
-            day = parsed.dt.dayofweek
-            month = parsed.dt.month
-            numeric[f"{column}__weekday_sin"] = np.sin((2.0 * math.pi * day) / 7.0)
-            numeric[f"{column}__weekday_cos"] = np.cos((2.0 * math.pi * day) / 7.0)
-            numeric[f"{column}__month_sin"] = np.sin((2.0 * math.pi * month) / 12.0)
-            numeric[f"{column}__month_cos"] = np.cos((2.0 * math.pi * month) / 12.0)
-
-        numeric["outbound_days_from_sale"] = pd.to_numeric(working["outbound_days_from_sale"], errors="coerce")
-        numeric["return_gap_days"] = pd.to_numeric(working["return_gap_days"], errors="coerce").mask(
-            pd.to_numeric(working["return_gap_days"], errors="coerce") < 0
-        )
-        numeric["is_round_trip"] = pd.to_numeric(working["is_round_trip"], errors="coerce")
-        numeric["domestic_flag"] = pd.to_numeric(working["domestic_flag"], errors="coerce")
-        numeric["log1p_route_great_circle_miles"] = np.log1p(np.clip(pd.to_numeric(working["route_great_circle_miles"], errors="coerce"), 0, None))
-
-        for column in self.schema.categorical_columns:
-            if column in self.schema.datetime_columns:
-                continue
-            categorical[column] = working[column].astype("string")
-        categorical["market_token"] = working["market_token"].astype("string")
-        if "origin_country" in working.columns and "destination_country" in working.columns:
-            categorical["country_pair"] = (
-                working["origin_country"].astype("string").fillna("missing")
-                + "->"
-                + working["destination_country"].astype("string").fillna("missing")
+    for (departure_value, advance_bucket), (count, total_price) in accumulator.fare_calendar.items():
+        mean_price = (total_price / count) if count else None
+        records.append(
+            AggregateRecord(
+                view="fare_calendar",
+                branch=None,
+                key_1=departure_value,
+                key_2=advance_bucket,
+                key_3=None,
+                segment_id=None,
+                count=int(count),
+                mean_price=float(mean_price) if mean_price is not None else None,
+                value=None,
             )
+        )
 
-        numeric = numeric.replace([np.inf, -np.inf], np.nan)
-        categorical = categorical.fillna("missing")
-        return numeric, categorical, working
+    for (branch, segment_id), count in accumulator.branch_segment_counts.items():
+        records.append(
+            AggregateRecord(
+                view="segment_size",
+                branch=branch,
+                key_1=None,
+                key_2=None,
+                key_3=None,
+                segment_id=int(segment_id),
+                count=int(count),
+                mean_price=None,
+                value=None,
+            )
+        )
 
-    def _fit_preprocessor(self, numeric: pd.DataFrame, categorical: pd.DataFrame) -> tuple[np.ndarray, np.ndarray]:
-        if numeric.empty and categorical.empty:
-            raise ValueError("No usable engineered features remain after schema inference.")
-        self.numeric_feature_names = numeric.columns.tolist()
-        self.categorical_feature_names = categorical.columns.tolist()
+    for (pretrained_segment, finetuned_segment), count in accumulator.agreement_counts.items():
+        records.append(
+            AggregateRecord(
+                view="segment_agreement",
+                branch=None,
+                key_1=str(pretrained_segment),
+                key_2=str(finetuned_segment),
+                key_3=None,
+                segment_id=None,
+                count=int(count),
+                mean_price=None,
+                value=None,
+            )
+        )
 
-        numeric_array = np.zeros((len(numeric), len(self.numeric_feature_names)), dtype=np.float32)
-        for index, column in enumerate(self.numeric_feature_names):
-            series = pd.to_numeric(numeric[column], errors="coerce")
-            center = float(series.median()) if series.notna().any() else 0.0
-            q1 = float(series.quantile(0.25)) if series.notna().any() else 0.0
-            q3 = float(series.quantile(0.75)) if series.notna().any() else 0.0
-            scale = q3 - q1
-            if not np.isfinite(scale) or abs(scale) < EPSILON:
-                scale = float(series.std()) if series.notna().any() else 1.0
-            if not np.isfinite(scale) or abs(scale) < EPSILON:
-                scale = 1.0
-            self.numeric_centers[column] = center
-            self.numeric_scales[column] = scale
-            filled = series.fillna(center)
-            numeric_array[:, index] = ((filled - center) / scale).to_numpy(dtype=np.float32)
-
-        categorical_array = np.zeros((len(categorical), len(self.categorical_feature_names)), dtype=np.int64)
-        for index, column in enumerate(self.categorical_feature_names):
-            counts = categorical[column].astype("string").value_counts()
-            allowed = counts.head(max(self.config.max_categories - 2, 1)).index.tolist()
-            vocab = {"<unk>": 0, "<mask>": 1}
-            for item in allowed:
-                vocab[str(item)] = len(vocab)
-            self.categorical_vocabularies[column] = vocab
-            categorical_array[:, index] = categorical[column].astype("string").map(vocab).fillna(0).astype(int).to_numpy()
-        return numeric_array, categorical_array
-
-    def _transform_preprocessor(self, numeric: pd.DataFrame, categorical: pd.DataFrame) -> tuple[np.ndarray, np.ndarray]:
-        numeric_array = np.zeros((len(numeric), len(self.numeric_feature_names)), dtype=np.float32)
-        for index, column in enumerate(self.numeric_feature_names):
-            if column not in numeric.columns:
-                numeric_array[:, index] = 0.0
-                continue
-            series = pd.to_numeric(numeric[column], errors="coerce").fillna(self.numeric_centers[column])
-            numeric_array[:, index] = ((series - self.numeric_centers[column]) / self.numeric_scales[column]).to_numpy(dtype=np.float32)
-
-        categorical_array = np.zeros((len(categorical), len(self.categorical_feature_names)), dtype=np.int64)
-        for index, column in enumerate(self.categorical_feature_names):
-            vocab = self.categorical_vocabularies[column]
-            series = categorical[column].astype("string") if column in categorical.columns else pd.Series("missing", index=categorical.index)
-            categorical_array[:, index] = series.map(vocab).fillna(0).astype(int).to_numpy()
-        return numeric_array, categorical_array
-
-    def _fit_encoder(self, numeric_array: np.ndarray, categorical_array: np.ndarray) -> None:
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        self.encoder_device = device
-        cardinalities = [
-            max(self.categorical_vocabularies[column].values()) + 1 for column in self.categorical_feature_names
+    top_values: dict[str, set[str]] = {}
+    for feature in FINGERPRINT_FEATURES:
+        ranked = [
+            (value, count)
+            for (candidate_feature, value), count in accumulator.overall_feature_counts.items()
+            if candidate_feature == feature
         ]
-        self.encoder = FTTransformerEncoder(
-            numeric_count=len(self.numeric_feature_names),
-            categorical_cardinalities=cardinalities,
-            d_model=self.config.transformer_width,
-            n_heads=self.config.transformer_heads,
-            n_layers=self.config.transformer_layers,
-            dropout=self.config.transformer_dropout,
-            embedding_dim=self.config.embedding_dims,
-        ).to(device)
-        optimizer = torch.optim.AdamW(
-            self.encoder.parameters(),
-            lr=self.config.learning_rate,
-            weight_decay=self.config.weight_decay,
+        ranked.sort(key=lambda item: item[1], reverse=True)
+        top_values[feature] = {
+            value for value, _ in ranked[: model.config.max_fingerprint_values_per_feature]
+        }
+
+    for (branch, segment_id, feature, value), count in accumulator.branch_segment_feature_counts.items():
+        if value not in top_values.get(feature, set()):
+            continue
+        segment_total = accumulator.branch_segment_counts.get((branch, segment_id), 0)
+        overall_count = accumulator.overall_feature_counts.get((feature, value), 0)
+        if segment_total == 0 or overall_count == 0 or total_rows == 0:
+            continue
+        lift = math.log((count / segment_total + 1e-9) / (overall_count / total_rows + 1e-9))
+        records.append(
+            AggregateRecord(
+                view="segment_fingerprint",
+                branch=branch,
+                key_1=feature,
+                key_2=value,
+                key_3=None,
+                segment_id=int(segment_id),
+                count=int(count),
+                mean_price=None,
+                value=float(lift),
+            )
         )
 
-        numeric_tensor = torch.from_numpy(numeric_array)
-        categorical_tensor = torch.from_numpy(categorical_array if categorical_array.size else np.zeros((len(numeric_array), 0), dtype=np.int64))
-        dataset = TensorDataset(numeric_tensor, categorical_tensor)
-        batch_size = min(self.config.train_batch_size, max(len(dataset), 1))
-        loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
-
-        self.train_loss_history = []
-        self.encoder.train()
-        for _ in range(self.config.pretrain_epochs):
-            total_loss = 0.0
-            total_examples = 0
-            for batch_numeric, batch_categorical in loader:
-                batch_numeric = batch_numeric.to(device)
-                batch_categorical = batch_categorical.to(device)
-                aug_numeric_a, aug_categorical_a = self._corrupt_batch(batch_numeric, batch_categorical)
-                aug_numeric_b, aug_categorical_b = self._corrupt_batch(batch_numeric, batch_categorical)
-
-                emb_a, num_rec_a, cat_rec_a = self.encoder(aug_numeric_a, aug_categorical_a)
-                emb_b, _, _ = self.encoder(aug_numeric_b, aug_categorical_b)
-
-                proj_a = self.encoder.project(emb_a)
-                proj_b = self.encoder.project(emb_b)
-                loss = self._contrastive_loss(proj_a, proj_b)
-
-                if self.numeric_feature_names:
-                    numeric_loss = 0.0
-                    for index, prediction in enumerate(num_rec_a):
-                        numeric_loss = numeric_loss + F.smooth_l1_loss(prediction, batch_numeric[:, index])
-                    loss = loss + (0.2 * numeric_loss / max(len(num_rec_a), 1))
-
-                if self.categorical_feature_names:
-                    categorical_loss = 0.0
-                    for index, prediction in enumerate(cat_rec_a):
-                        categorical_loss = categorical_loss + F.cross_entropy(prediction, batch_categorical[:, index])
-                    loss = loss + (0.2 * categorical_loss / max(len(cat_rec_a), 1))
-
-                optimizer.zero_grad(set_to_none=True)
-                loss.backward()
-                optimizer.step()
-
-                total_examples += int(batch_numeric.shape[0])
-                total_loss += float(loss.item()) * batch_numeric.shape[0]
-            self.train_loss_history.append({"loss": total_loss / max(total_examples, 1)})
-        self.encoder.eval()
-
-    def _corrupt_batch(self, numeric: torch.Tensor, categorical: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        numeric_out = numeric.clone()
-        categorical_out = categorical.clone()
-        if numeric_out.numel():
-            numeric_mask = torch.rand_like(numeric_out) < self.config.corruption_rate
-            perm = torch.randperm(numeric_out.shape[0], device=numeric_out.device) if numeric_out.shape[0] > 1 else None
-            replacement = numeric_out[perm] if perm is not None else torch.zeros_like(numeric_out)
-            numeric_out = torch.where(numeric_mask, replacement, numeric_out)
-        if categorical_out.numel():
-            categorical_mask = torch.rand(categorical_out.shape, device=categorical_out.device) < self.config.corruption_rate
-            if categorical_out.shape[0] > 1:
-                replacement = categorical_out[torch.randperm(categorical_out.shape[0], device=categorical_out.device)]
-            else:
-                replacement = torch.zeros_like(categorical_out)
-            use_mask_token = torch.rand(categorical_out.shape, device=categorical_out.device) < 0.5
-            replacement = torch.where(use_mask_token, torch.ones_like(categorical_out), replacement)
-            categorical_out = torch.where(categorical_mask, replacement, categorical_out)
-        return numeric_out, categorical_out
-
-    def _contrastive_loss(self, proj_a: torch.Tensor, proj_b: torch.Tensor) -> torch.Tensor:
-        proj_a = F.normalize(proj_a, dim=-1)
-        proj_b = F.normalize(proj_b, dim=-1)
-        logits = torch.matmul(proj_a, proj_b.T) / self.config.contrastive_temperature
-        labels = torch.arange(logits.shape[0], device=logits.device)
-        return (F.cross_entropy(logits, labels) + F.cross_entropy(logits.T, labels)) / 2.0
-
-    @torch.inference_mode()
-    def _encode_embeddings(self, numeric_array: np.ndarray, categorical_array: np.ndarray) -> np.ndarray:
-        assert self.encoder is not None
-        numeric_tensor = torch.from_numpy(numeric_array)
-        categorical_tensor = torch.from_numpy(categorical_array if categorical_array.size else np.zeros((len(numeric_array), 0), dtype=np.int64))
-        dataset = TensorDataset(numeric_tensor, categorical_tensor)
-        batch_size = min(self.config.train_batch_size, max(len(dataset), 1))
-        loader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
-        embeddings: list[np.ndarray] = []
-        self.encoder.eval()
-        for batch_numeric, batch_categorical in loader:
-            batch_numeric = batch_numeric.to(self.encoder_device)
-            batch_categorical = batch_categorical.to(self.encoder_device)
-            cls_embedding, _, _ = self.encoder(batch_numeric, batch_categorical)
-            embeddings.append(cls_embedding.cpu().numpy())
-        return np.concatenate(embeddings, axis=0).astype(np.float32)
-
-    def _fit_segmenter(self, embeddings: np.ndarray) -> np.ndarray:
-        min_cluster_size = min(max(self.config.min_segment_size, len(embeddings) // 200), max(len(embeddings) // 10, 2))
-        clusterer = hdbscan.HDBSCAN(
-            min_cluster_size=max(min_cluster_size, 2),
-            min_samples=max(min_cluster_size // 2, 2),
-            prediction_data=True,
-            cluster_selection_method="eom",
+    aggregate_frame = pd.DataFrame([asdict(record) for record in records])
+    if aggregate_frame.empty:
+        return pd.DataFrame(
+            columns=["view", "branch", "key_1", "key_2", "key_3", "segment_id", "count", "mean_price", "value"]
         )
-        labels = clusterer.fit_predict(embeddings)
-        unique_labels = {int(label) for label in labels if int(label) >= 0}
-        if len(unique_labels) < 2:
-            fallback_clusters = min(8, max(2, len(embeddings) // 5_000 or 2))
-            fallback = MiniBatchKMeans(
-                n_clusters=fallback_clusters,
-                random_state=self.config.random_seed,
-                batch_size=min(self.config.train_batch_size, len(embeddings)),
-                n_init="auto",
-            )
-            labels = fallback.fit_predict(embeddings)
-            self.segmenter = fallback
-            self.segmenter_kind = "kmeans_fallback"
-        else:
-            self.segmenter = clusterer
-            self.segmenter_kind = "hdbscan"
-
-        self.cluster_count = len({int(label) for label in labels if int(label) >= 0})
-        self.noise_fraction = float(np.mean(labels == -1)) if self.segmenter_kind == "hdbscan" else 0.0
-        return labels.astype(int)
-
-    def _predict_segments(self, embeddings: np.ndarray) -> np.ndarray:
-        if self.segmenter is None:
-            raise ValueError("Segmenter must be fitted before transform().")
-        if self.segmenter_kind == "hdbscan":
-            labels, _ = hdbscan.approximate_predict(self.segmenter, embeddings)
-            return labels.astype(int)
-        return self.segmenter.predict(embeddings).astype(int)
-
-    def _assemble_output_frame(
-        self,
-        frame: pd.DataFrame,
-        engineered: pd.DataFrame,
-        embeddings: np.ndarray,
-        labels: np.ndarray,
-    ) -> pd.DataFrame:
-        assert self.schema is not None
-        output_columns = METADATA_COLUMNS + [column for column in self.schema.retained_columns if column in frame.columns]
-        output = frame[output_columns].copy()
-        derived_columns = {
-            "market_token": engineered["market_token"].astype("string"),
-            "domestic_flag": pd.to_numeric(engineered["domestic_flag"], errors="coerce"),
-            "is_round_trip": pd.to_numeric(engineered["is_round_trip"], errors="coerce"),
-            "return_gap_days": pd.to_numeric(engineered["return_gap_days"], errors="coerce"),
-            "return_gap_bucket": engineered["return_gap_bucket"].astype("string"),
-        }
-        if "price_inc" in frame.columns:
-            price = pd.to_numeric(frame["price_inc"], errors="coerce")
-            derived_columns["log_price_inc"] = np.log1p(np.clip(price.fillna(0.0), 0, None))
-        if "advance_purchase" in frame.columns:
-            derived_columns["advance_purchase_bucket"] = _bucketize_numeric(
-                pd.to_numeric(frame["advance_purchase"], errors="coerce"),
-                [0, 7, 14, 30, 60, 90, 180, 400],
-            )
-        for name, series in derived_columns.items():
-            output[name] = series
-        for index in range(embeddings.shape[1]):
-            output[f"embedding_{index:03d}"] = embeddings[:, index]
-        output["segment_id"] = labels.astype(int)
-        return output
-
-    def _build_metrics(self, frame: pd.DataFrame, embeddings: np.ndarray, labels: np.ndarray) -> dict[str, Any]:
-        assert self.schema is not None
-        non_noise = labels[labels >= 0] if self.segmenter_kind == "hdbscan" else labels
-        segment_sizes = pd.Series(labels).value_counts().sort_index().to_dict()
-        dominance = 0.0
-        if len(labels):
-            dominance = max(segment_sizes.values()) / len(labels)
-        return {
-            "sample_rows": int(len(frame)),
-            "train_rows": int(len(frame)),
-            "retained_columns": self.schema.retained_columns,
-            "excluded_columns": self.schema.excluded_columns,
-            "hover_columns": self.schema.hover_columns,
-            "numeric_feature_count": len(self.numeric_feature_names),
-            "categorical_feature_count": len(self.categorical_feature_names),
-            "embedding_dims": int(embeddings.shape[1]),
-            "encoder_backend": self.config.encoder_backend,
-            "segment_method": self.segmenter_kind,
-            "segment_count": int(len({int(label) for label in non_noise})),
-            "segment_sizes": {str(key): int(value) for key, value in segment_sizes.items()},
-            "cluster_dominance": float(dominance),
-            "noise_fraction": float(self.noise_fraction),
-            "schema": self.schema.to_dict(),
-            "geocode_coverage": self.geocode_coverage,
-            "winsorization_thresholds": {
-                key: {"lower": float(value[0]), "upper": float(value[1])}
-                for key, value in self.raw_winsorization.items()
-            },
-            "training": {
-                "epochs": self.config.pretrain_epochs,
-                "batch_size": self.config.train_batch_size,
-                "learning_rate": self.config.learning_rate,
-                "weight_decay": self.config.weight_decay,
-                "loss_history": self.train_loss_history,
-            },
-            "config": self.config.to_dict(),
-        }
-
-    def to_bundle(self) -> dict[str, Any]:
-        if self.encoder is None or self.schema is None:
-            raise ValueError("Model must be fitted before serialization.")
-        return {
-            "config": self.config.to_dict(),
-            "schema": self.schema.to_dict(),
-            "numeric_feature_names": self.numeric_feature_names,
-            "categorical_feature_names": self.categorical_feature_names,
-            "numeric_centers": self.numeric_centers,
-            "numeric_scales": self.numeric_scales,
-            "raw_winsorization": self.raw_winsorization,
-            "categorical_vocabularies": self.categorical_vocabularies,
-            "encoder_device": self.encoder_device,
-            "encoder_state_dict": self.encoder.state_dict(),
-            "encoder_model_args": {
-                "numeric_count": len(self.numeric_feature_names),
-                "categorical_cardinalities": [
-                    max(self.categorical_vocabularies[column].values()) + 1 for column in self.categorical_feature_names
-                ],
-                "d_model": self.config.transformer_width,
-                "n_heads": self.config.transformer_heads,
-                "n_layers": self.config.transformer_layers,
-                "dropout": self.config.transformer_dropout,
-                "embedding_dim": self.config.embedding_dims,
-            },
-            "segmenter": self.segmenter,
-            "segmenter_kind": self.segmenter_kind,
-            "projection_spec": asdict(self.projection_spec) if self.projection_spec else None,
-            "projector": self.projector,
-            "geocode_coverage": self.geocode_coverage,
-        }
-
-
-def fit_embedding_model(frame: pd.DataFrame, config: DCOVisualizeConfig) -> FitResult:
-    model = TabularEmbeddingModel(config)
-    metrics = model.fit(frame)
-    return FitResult(model=model, metrics=metrics)
-
-
-def write_embedding_bundle(path: str | Path, model: TabularEmbeddingModel) -> None:
-    torch.save(model.to_bundle(), path)
-
-
-def stratify_visualization_sample(frame: pd.DataFrame, viz_rows: int, random_seed: int) -> pd.DataFrame:
-    if len(frame) <= viz_rows:
-        return frame.reset_index(drop=True)
-    sampled = frame.copy()
-    if "log_price_inc" not in sampled.columns:
-        if "price_inc" in sampled.columns:
-            sampled["log_price_inc"] = np.log1p(np.clip(pd.to_numeric(sampled["price_inc"], errors="coerce").fillna(0.0), 0, None))
-        else:
-            sampled["log_price_inc"] = 0.0
-    quantiles = min(10, max(2, sampled["log_price_inc"].nunique(dropna=True)))
-    sampled["fare_bucket"] = pd.qcut(sampled["log_price_inc"].rank(method="first"), q=quantiles, duplicates="drop").astype("string")
-    sampled["_stratum"] = (
-        sampled.get("segment_id", pd.Series(0, index=sampled.index)).astype("string").fillna("missing")
-        + "|"
-        + sampled.get("trip_type", pd.Series("missing", index=sampled.index)).astype("string").fillna("missing")
-        + "|"
-        + sampled.get("stops", pd.Series("missing", index=sampled.index)).astype("string").fillna("missing")
-        + "|"
-        + sampled["fare_bucket"].astype("string").fillna("missing")
+    return aggregate_frame.sort_values(["view", "branch", "segment_id", "count"], ascending=[True, True, True, False]).reset_index(
+        drop=True
     )
-
-    rng = np.random.default_rng(random_seed)
-    counts = sampled["_stratum"].value_counts()
-    allocated = {stratum: max(1, int(math.floor(viz_rows * count / len(sampled)))) for stratum, count in counts.items()}
-    current = sum(allocated.values())
-    if current > viz_rows:
-        for stratum in sorted(allocated, key=allocated.get, reverse=True):
-            if current <= viz_rows:
-                break
-            if allocated[stratum] > 1:
-                allocated[stratum] -= 1
-                current -= 1
-    elif current < viz_rows:
-        for stratum in counts.index.tolist():
-            if current >= viz_rows:
-                break
-            allocated[stratum] += 1
-            current += 1
-
-    selections: list[pd.DataFrame] = []
-    for stratum, take in allocated.items():
-        group = sampled[sampled["_stratum"] == stratum]
-        if group.empty:
-            continue
-        take = min(take, len(group))
-        if take >= len(group):
-            selections.append(group)
-            continue
-        indices = rng.choice(group.index.to_numpy(), size=take, replace=False)
-        selections.append(group.loc[indices])
-    result = pd.concat(selections, ignore_index=True)
-    if len(result) > viz_rows:
-        result = result.sample(n=viz_rows, random_state=random_seed)
-    return result.drop(columns=["_stratum", "fare_bucket"], errors="ignore").sort_values(["segment_id", "market_token"], kind="stable").reset_index(drop=True)
 
 
 def transform_parquet_file(
-    model: TabularEmbeddingModel,
+    model: TabPFNEmbeddingModel,
     parquet_path: str | Path,
     output_path: str | Path,
     viz_rows: int,
@@ -1136,60 +876,126 @@ def transform_parquet_file(
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    total_rows = parquet_row_count(str(parquet_path))
-    candidate_rows = min(total_rows, max(viz_rows, viz_rows * model.config.viz_candidate_multiplier))
-    sample_indices = sample_row_indices(total_rows, candidate_rows, random_seed)
-    sample_cursor = 0
-    batch_offset = 0
-    embedded_rows = 0
-    segment_sizes: dict[int, int] = {}
-    candidate_frames: list[pd.DataFrame] = []
+    with parquet_path.open("rb") as handle:
+        parquet = pq.ParquetFile(handle)
+        total_rows = int(parquet.metadata.num_rows)
+    LOGGER.info(
+        "Starting parquet transform for %s rows=%d viz_rows=%d batch_size=%d output=%s",
+        parquet_path,
+        total_rows,
+        viz_rows,
+        batch_size,
+        output_path,
+    )
+
+    viz_indices = sample_row_indices(total_rows, viz_rows, random_seed)
+    viz_frames: list[pd.DataFrame] = []
+    accumulator = AggregateAccumulator.create()
     writer: pq.ParquetWriter | None = None
-    collector = AggregateCollector()
+    batch_start = 0
 
     try:
         with parquet_path.open("rb") as handle:
             parquet = pq.ParquetFile(handle)
-            for batch in parquet.iter_batches(batch_size=batch_size):
-                frame = pa.Table.from_batches([batch]).to_pandas()
-                transformed, _ = model.transform(frame)
-                embedded_rows += len(transformed)
-                collector.update(transformed)
+            for batch_index, batch in enumerate(parquet.iter_batches(batch_size=batch_size), start=1):
+                batch_frame = pa.Table.from_batches([batch]).to_pandas()
+                transformed_batch, _ = transform_frame(model, batch_frame)
+                _update_aggregates(accumulator, transformed_batch, model)
+                viz_rows_frame = _collect_viz_rows(
+                    transformed_batch,
+                    global_indices=viz_indices,
+                    batch_start=batch_start,
+                    batch_end=batch_start + len(transformed_batch),
+                )
+                if not viz_rows_frame.empty:
+                    viz_frames.append(viz_rows_frame)
 
-                counts = transformed["segment_id"].value_counts().to_dict()
-                for segment_id, count in counts.items():
-                    segment_sizes[int(segment_id)] = segment_sizes.get(int(segment_id), 0) + int(count)
-
-                transformed_table = pa.Table.from_pandas(transformed, preserve_index=False)
+                table = pa.Table.from_pandas(transformed_batch, preserve_index=False)
                 if writer is None:
-                    writer = pq.ParquetWriter(output_path, transformed_table.schema, compression="zstd")
-                writer.write_table(transformed_table)
-
-                batch_end = batch_offset + batch.num_rows
-                next_cursor = int(np.searchsorted(sample_indices, batch_end, side="left"))
-                if next_cursor > sample_cursor:
-                    local_indices = (sample_indices[sample_cursor:next_cursor] - batch_offset).astype(int, copy=False)
-                    candidate_frames.append(transformed.iloc[local_indices].reset_index(drop=True))
-                    sample_cursor = next_cursor
-                batch_offset = batch_end
+                    writer = pq.ParquetWriter(output_path, table.schema, compression="zstd")
+                writer.write_table(table)
+                batch_start += len(transformed_batch)
+                if batch_index == 1 or batch_start == total_rows or batch_index % 10 == 0:
+                    LOGGER.info(
+                        "Transform progress: batches=%d rows=%d/%d viz_rows_collected=%d",
+                        batch_index,
+                        batch_start,
+                        total_rows,
+                        sum(len(frame) for frame in viz_frames),
+                    )
     finally:
         if writer is not None:
             writer.close()
 
-    if not candidate_frames:
-        raise ValueError("No rows were collected for visualization sampling.")
+    viz_frame = pd.concat(viz_frames, ignore_index=True) if viz_frames else pd.DataFrame()
+    if not viz_frame.empty:
+        pretrained_columns = [column for column in viz_frame.columns if column.startswith("pretrained_emb_")]
+        finetuned_columns = [column for column in viz_frame.columns if column.startswith("finetuned_emb_")]
 
-    candidate_frame = pd.concat(candidate_frames, ignore_index=True)
-    viz_frame = stratify_visualization_sample(candidate_frame, viz_rows=viz_rows, random_seed=random_seed)
-    viz_frame, projection_metrics = model.project_visualization_sample(viz_frame)
-    aggregate_frame = collector.to_frame()
+        pretrained_projector, pretrained_coords, pretrained_projection, pretrained_trust = _fit_layout(
+            viz_frame[pretrained_columns].to_numpy(dtype=np.float32, copy=False),
+            model.config,
+        )
+        finetuned_projector, finetuned_coords, finetuned_projection, finetuned_trust = _fit_layout(
+            viz_frame[finetuned_columns].to_numpy(dtype=np.float32, copy=False),
+            model.config,
+        )
 
+        viz_frame["pretrained_layout_x"] = pretrained_coords[:, 0]
+        viz_frame["pretrained_layout_y"] = pretrained_coords[:, 1]
+        viz_frame["finetuned_layout_x"] = finetuned_coords[:, 0]
+        viz_frame["finetuned_layout_y"] = finetuned_coords[:, 1]
+        viz_frame["layout_method"] = "densmap"
+
+        model.pretrained.projector = pretrained_projector
+        model.pretrained.projection = pretrained_projection
+        model.finetuned.projector = finetuned_projector
+        model.finetuned.projection = finetuned_projection
+    else:
+        pretrained_trust = 1.0
+        finetuned_trust = 1.0
+        viz_frame["layout_method"] = []
+
+    aggregate_frame = _finalize_aggregate_frame(accumulator, model, total_rows)
     metrics = {
-        "embedded_rows": int(embedded_rows),
+        "embedded_rows": total_rows,
         "viz_rows": int(len(viz_frame)),
-        "segment_sizes": {str(key): int(value) for key, value in sorted(segment_sizes.items())},
-        "segment_count": int(len({segment_id for segment_id in segment_sizes if segment_id >= 0})),
-        "noise_fraction": float(model.noise_fraction),
-        **projection_metrics,
+        "pretrained_embedding_dim": model.pretrained.embedding_dim,
+        "finetuned_embedding_dim": model.finetuned.embedding_dim,
+        "pretrained_projection": asdict(model.pretrained.projection) if model.pretrained.projection else None,
+        "finetuned_projection": asdict(model.finetuned.projection) if model.finetuned.projection else None,
+        "pretrained_projection_trustworthiness": float(pretrained_trust),
+        "finetuned_projection_trustworthiness": float(finetuned_trust),
+        "pretrained_segment_count": model.pretrained.segmenter.n_clusters,
+        "finetuned_segment_count": model.finetuned.segmenter.n_clusters,
     }
+    LOGGER.info(
+        "Completed parquet transform: embedded_rows=%d viz_rows=%d aggregate_rows=%d pretrained_segments=%d finetuned_segments=%d",
+        total_rows,
+        len(viz_frame),
+        len(aggregate_frame),
+        model.pretrained.segmenter.n_clusters,
+        model.finetuned.segmenter.n_clusters,
+    )
     return viz_frame, aggregate_frame, metrics
+
+
+def write_embedding_bundle(path: str | Path, model: TabPFNEmbeddingModel) -> None:
+    bundle = {
+        "config": model.config.to_dict(),
+        "target_column": model.target_column,
+        "feature_columns": model.feature_columns,
+        "feature_kinds": model.feature_kinds,
+        "categorical_feature_indices": model.categorical_feature_indices,
+        "excluded_columns": model.excluded_columns,
+        "hover_columns": model.hover_columns,
+        "route_source_column": model.route_source_column,
+        "route_destination_column": model.route_destination_column,
+        "departure_date_column": model.departure_date_column,
+        "advance_purchase_column": model.advance_purchase_column,
+        "return_date_column": model.return_date_column,
+        "pretrained": model.pretrained,
+        "finetuned": model.finetuned,
+    }
+    torch.save(bundle, Path(path))
+    LOGGER.info("Wrote embedding bundle to %s", path)

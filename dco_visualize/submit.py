@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import logging
 import os
 import sys
 import tempfile
@@ -30,6 +31,16 @@ from dco_visualize.io import (
 )
 from dco_visualize.workflow import execute
 
+LOGGER = logging.getLogger(__name__)
+
+
+def _configure_logging() -> None:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s - %(message)s",
+        force=True,
+    )
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Submit the DCO visualization Flyte workflow.")
@@ -48,14 +59,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--train-rows",
         type=int,
-        default=1_000_000,
-        help="Maximum rows used to train the encoder before full-partition inference.",
+        default=50_000,
+        help="Maximum rows used to fit the TabPFN branches before full-partition inference.",
     )
     parser.add_argument(
         "--viz-rows",
         type=int,
-        default=200_000,
-        help="Rows retained for densMAP visualization and dashboard diagnostics.",
+        default=50_000,
+        help="Rows retained for embedding comparison and dashboard diagnostics.",
     )
     parser.add_argument(
         "--full-day",
@@ -65,8 +76,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--embedding-dims",
         type=int,
-        default=128,
-        help="Embedding width produced by the foundation-style encoder.",
+        default=0,
+        help="Unused override retained for compatibility. TabPFN determines embedding width.",
     )
     parser.add_argument(
         "--output-prefix",
@@ -76,7 +87,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--batch-size",
         type=int,
-        default=50_000,
+        default=10_000,
         help="Parquet batch size used during streaming sample extraction and full-day transforms.",
     )
     parser.add_argument(
@@ -99,6 +110,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
+    _configure_logging()
     args = parse_args()
     config = DCOVisualizeConfig(
         customer=args.customer,
@@ -114,14 +126,14 @@ def main() -> None:
     if args.source_aws_profile:
         os.environ["AWS_PROFILE"] = args.source_aws_profile
 
-    print(f"Enumerating source parquet objects from {config.input_uri}...")
+    LOGGER.info("Enumerating source parquet objects from %s", config.input_uri)
     parquet_uris = list_s3_parquet_objects(config.input_uri)
     if not parquet_uris:
         raise ValueError(f"No parquet files found under {config.input_uri}")
     parquet_objects = collect_parquet_metadata(parquet_uris)
     total_rows = sum(item.row_count for item in parquet_objects)
     sample_rows = total_rows if args.full_day else min(config.sample_rows, total_rows)
-    train_rows = min(config.train_rows, sample_rows)
+    train_rows = min(config.train_rows, sample_rows, 50_000)
     config = DCOVisualizeConfig(
         customer=args.customer,
         sales_date=args.sales_date,
@@ -133,13 +145,13 @@ def main() -> None:
         batch_size=args.batch_size,
     )
     config.validate()
-    print(f"Found {len(parquet_uris)} parquet files and {total_rows:,} rows")
+    LOGGER.info("Found %d parquet files and %s rows", len(parquet_uris), f"{total_rows:,}")
     if args.full_day:
-        print(f"Full-day mode enabled: embedding all {config.sample_rows:,} rows")
-    print(f"Train rows: {config.train_rows:,}")
-    print(f"Viz rows: {config.viz_rows:,}")
+        LOGGER.info("Full-day mode enabled: embedding all %s rows", f"{config.sample_rows:,}")
+    LOGGER.info("Train rows: %s", f"{config.train_rows:,}")
+    LOGGER.info("Viz rows: %s", f"{config.viz_rows:,}")
 
-    print("Building staged input artifacts locally...")
+    LOGGER.info("Building staged input artifacts locally")
     staging_dir = Path(tempfile.mkdtemp(prefix="dco_visualize_submit_"))
     sample_path = staging_dir / "sample.parquet"
     train_sample_path = staging_dir / "train_sample.parquet"
@@ -165,7 +177,7 @@ def main() -> None:
         )
         train_frame.to_parquet(train_sample_path, index=False)
         write_json(profile_path, profile)
-        print(f"Prepared full-day parquet with {config.sample_rows:,} rows for remote execution")
+        LOGGER.info("Prepared full-day parquet with %s rows for remote execution", f"{config.sample_rows:,}")
     else:
         sample_frame, profile = sample_parquet_files(
             parquet_uris=parquet_uris,
@@ -187,13 +199,13 @@ def main() -> None:
             )
         train_frame.to_parquet(train_sample_path, index=False)
         write_json(profile_path, profile)
-        print(f"Prepared {len(sample_frame):,} staged rows for remote execution")
+        LOGGER.info("Prepared %s staged rows for remote execution", f"{len(sample_frame):,}")
 
     config_path = REPO_ROOT / ".flyte" / "config.yaml"
     flyte_config = Config.auto(config_path)
 
-    print("Initializing Flyte connection...")
-    print(f"Flyte auth type: {args.auth_type}")
+    LOGGER.info("Initializing Flyte connection")
+    LOGGER.info("Flyte auth type: %s", args.auth_type)
     flyte.init(
         org=flyte_config.task.org,
         project=flyte_config.task.project,
@@ -217,8 +229,8 @@ def main() -> None:
 
     run_timestamp = make_run_timestamp()
     destination_prefix = config.run_output_prefix(run_timestamp)
-    print(f"Submitting DCO visualization for {config.customer} on {config.sales_date}")
-    print(f"Run timestamp: {run_timestamp}")
+    LOGGER.info("Submitting DCO visualization for customer=%s sales_date=%s", config.customer, config.sales_date)
+    LOGGER.info("Run timestamp: %s", run_timestamp)
 
     upload_urls = generate_presigned_upload_urls(
         destination_prefix=destination_prefix,
@@ -232,14 +244,16 @@ def main() -> None:
             "metrics.json",
             "dashboard.html",
             "manifest.json",
-            "embedding_density.png",
-            "metro_flow_map.png",
+            "pretrained_embedding_density.png",
+            "finetuned_embedding_density.png",
+            "route_network.png",
             "fare_calendar.png",
             "market_matrix.png",
             "segment_fingerprint.png",
         ],
         profile_name=args.output_aws_profile,
     )
+    LOGGER.info("Generated %d presigned upload URLs", len(upload_urls))
     run = flyte.with_runcontext(copy_style="all").run(
         execute,
         customer=config.customer,
@@ -256,14 +270,14 @@ def main() -> None:
         profile_file=File.from_local_sync(profile_path),
         upload_urls=upload_urls,
     )
-    print(f"Execution URL: {run.url}")
+    LOGGER.info("Execution URL: %s", run.url)
 
-    print("Waiting for Flyte execution to complete...")
+    LOGGER.info("Waiting for Flyte execution to complete")
     run.wait()
     if run.phase == ActionPhase.SUCCEEDED:
-        print("Flyte execution completed successfully.")
+        LOGGER.info("Flyte execution completed successfully")
     else:
-        print(f"Flyte execution finished in phase {run.phase}.")
+        LOGGER.info("Flyte execution finished in phase %s", run.phase)
 
 
 if __name__ == "__main__":

@@ -1,13 +1,21 @@
 # dco_visualize
 
-Flyte workflow for sampling DCO parquet data, training a foundation-style tabular encoder, segmenting the resulting row embeddings, and publishing a travel-native dashboard to S3.
+Flyte workflow for sampling DCO parquet data, fitting two TabPFN 2.5 branches over the raw DCO columns, extracting row embeddings directly from the fitted regressors, and publishing a comparison dashboard to S3.
 
 ## Default target
 
 - Source day prefix: `s3://s3-atp-3victors-3vprod-use1-derived-common-output/v1/AA/2026/03/07/`
 - Output: `s3://3v-teo-dev/dco_visualize/`
 
-The workflow samples recursively across all hourly parquet shards under the requested day, trains on a bounded stratified subset, runs batched inference over the target partition, and renders a standalone dashboard with fare calendar, metro flow, market matrix, segment fingerprints, and densMAP diagnostics.
+The workflow samples recursively across all hourly parquet shards under the requested day, trains on a bounded subset, runs batched inference over the target partition, and renders a standalone dashboard with:
+
+- pretrained TabPFN 2.5 embeddings
+- fine-tuned TabPFN 2.5 embeddings
+- route network and market matrix views
+- fare calendar surfaces
+- segment fingerprints and branch-agreement diagnostics
+
+The Flyte task name stays `dco-visualize-overwatch.execute`.
 
 ## Submission
 
@@ -18,7 +26,7 @@ Run from the repo root:
   --customer AA \
   --sales-date 2026-03-07 \
   --sample-rows 100000 \
-  --train-rows 100000 \
+  --train-rows 50000 \
   --viz-rows 50000 \
   --output-prefix s3://3v-teo-dev/dco_visualize/
 ```
@@ -32,10 +40,24 @@ If the browser-based PKCE flow is blocked in the terminal session, use device fl
   --sample-rows 1000 \
   --train-rows 1000 \
   --viz-rows 500 \
-  --embedding-dims 32 \
   --output-prefix s3://3v-teo-dev/dco_visualize/ \
   --auth-type DeviceFlow
 ```
+
+## Local demo
+
+Run a bounded local DCO demo, modeled after the upstream TabPFN notebook flow but specialized to AA/day DCO data:
+
+```bash
+.venv/bin/python dco_visualize/tabpfn_dco_demo_local.py \
+  --customer AA \
+  --sales-date 2026-03-07 \
+  --sample-rows 5000 \
+  --train-rows 2500 \
+  --viz-rows 2000
+```
+
+This writes local artifacts under `dco_visualize/demo_outputs/`.
 
 ## Artifacts
 
@@ -49,8 +71,9 @@ Each run publishes:
 - `embedding_bundle.pt`
 - `metrics.json`
 - `dashboard.html`
-- `embedding_density.png`
-- `metro_flow_map.png`
+- `pretrained_embedding_density.png`
+- `finetuned_embedding_density.png`
+- `route_network.png`
 - `fare_calendar.png`
 - `market_matrix.png`
 - `segment_fingerprint.png`

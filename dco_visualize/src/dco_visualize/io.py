@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import http.client
+import logging
 import os
 from dataclasses import dataclass
 from functools import lru_cache
@@ -17,6 +18,7 @@ import pyarrow.parquet as pq
 import s3fs
 
 METADATA_COLUMNS = ["row_id", "source_uri", "source_row_number", "customer", "sales_date"]
+LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -58,20 +60,25 @@ def list_s3_parquet_objects(prefix_uri: str) -> list[str]:
     client = boto3.client("s3")
     paginator = client.get_paginator("list_objects_v2")
 
+    LOGGER.info("Listing parquet objects under %s", prefix_uri)
     parquet_uris: list[str] = []
+    page_count = 0
     for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+        page_count += 1
         for item in page.get("Contents", []):
             key = item["Key"]
             if key.endswith(".parquet"):
                 parquet_uris.append(f"s3://{bucket}/{key}")
 
     parquet_uris.sort()
+    LOGGER.info("Listed %d parquet objects under %s across %d pages", len(parquet_uris), prefix_uri, page_count)
     return parquet_uris
 
 
 def collect_parquet_metadata(parquet_uris: list[str]) -> list[ParquetObject]:
+    LOGGER.info("Collecting parquet metadata for %d files", len(parquet_uris))
     objects: list[ParquetObject] = []
-    for uri in parquet_uris:
+    for index, uri in enumerate(parquet_uris, start=1):
         with open_uri(uri, "rb") as handle:
             parquet = pq.ParquetFile(handle)
             objects.append(
@@ -81,6 +88,8 @@ def collect_parquet_metadata(parquet_uris: list[str]) -> list[ParquetObject]:
                     hour=uri.rstrip("/").split("/")[-2],
                 )
             )
+        if index == len(parquet_uris) or index % 20 == 0:
+            LOGGER.info("Collected parquet metadata for %d/%d files", index, len(parquet_uris))
     return objects
 
 
@@ -121,6 +130,35 @@ def decorate_frame_with_metadata(
     return enriched
 
 
+def _metadata_field(name: str) -> pa.Field:
+    if name in {"row_id", "source_uri", "customer", "sales_date"}:
+        return pa.field(name, pa.string())
+    if name == "source_row_number":
+        return pa.field(name, pa.int64())
+    raise KeyError(f"Unsupported metadata field: {name}")
+
+
+def _unified_source_schema(parquet_uris: list[str]) -> pa.Schema:
+    schemas: list[pa.Schema] = []
+    for uri in parquet_uris:
+        with open_uri(uri, "rb") as handle:
+            schemas.append(pq.ParquetFile(handle).schema_arrow)
+    return pa.unify_schemas(schemas)
+
+
+def _schema_for_enriched_frame(columns: list[str], source_schema: pa.Schema) -> pa.Schema:
+    source_fields = {field.name: field for field in source_schema}
+    fields: list[pa.Field] = []
+    for column in columns:
+        if column in source_fields:
+            fields.append(source_fields[column])
+        elif column in METADATA_COLUMNS:
+            fields.append(_metadata_field(column))
+        else:
+            raise KeyError(f"Column {column!r} is missing from the unified schema.")
+    return pa.schema(fields)
+
+
 def sample_parquet_files(
     parquet_uris: list[str],
     sample_size: int,
@@ -137,12 +175,21 @@ def sample_parquet_files(
     total_rows = sum(item.row_count for item in parquet_objects)
     if total_rows == 0:
         raise ValueError("Parquet files were found but contain zero rows.")
+    LOGGER.info(
+        "Sampling %d rows from %d parquet files for customer=%s sales_date=%s total_rows=%d",
+        sample_size,
+        len(parquet_objects),
+        customer,
+        sales_date,
+        total_rows,
+    )
 
     global_indices = sample_row_indices(total_rows, sample_size, random_seed)
 
     sample_frames: list[pd.DataFrame] = []
     file_start = 0
-    for item in parquet_objects:
+    sampled_files = 0
+    for index, item in enumerate(parquet_objects, start=1):
         file_end = file_start + item.row_count
         left = int(np.searchsorted(global_indices, file_start, side="left"))
         right = int(np.searchsorted(global_indices, file_end, side="left"))
@@ -152,6 +199,7 @@ def sample_parquet_files(
             file_start = file_end
             continue
 
+        sampled_files += 1
         cursor = 0
         batch_offset = 0
         with open_uri(item.uri, "rb") as handle:
@@ -173,9 +221,25 @@ def sample_parquet_files(
                     cursor = next_cursor
                 batch_offset = batch_end
         file_start = file_end
+        if index == len(parquet_objects) or index % 20 == 0:
+            collected_rows = sum(len(frame) for frame in sample_frames)
+            LOGGER.info(
+                "Sampling progress: files=%d/%d sampled_files=%d collected_rows=%d/%d",
+                index,
+                len(parquet_objects),
+                sampled_files,
+                collected_rows,
+                min(sample_size, total_rows),
+            )
 
     sample_frame = pd.concat(sample_frames, ignore_index=True)
     profile = build_profile(sample_frame, parquet_objects, total_rows, sales_date, customer)
+    LOGGER.info(
+        "Completed sampling: sample_rows=%d total_rows=%d parquet_files=%d",
+        len(sample_frame),
+        total_rows,
+        len(parquet_objects),
+    )
     return sample_frame, profile
 
 
@@ -194,12 +258,20 @@ def materialize_parquet_files(
     parquet_objects = parquet_objects or collect_parquet_metadata(parquet_uris)
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    LOGGER.info(
+        "Materializing %d parquet files into %s for customer=%s sales_date=%s",
+        len(parquet_objects),
+        output_path,
+        customer,
+        sales_date,
+    )
 
     writer: pq.ParquetWriter | None = None
     total_rows = 0
+    source_schema = _unified_source_schema(parquet_uris)
 
     try:
-        for item in parquet_objects:
+        for index, item in enumerate(parquet_objects, start=1):
             with open_uri(item.uri, "rb") as handle:
                 parquet = pq.ParquetFile(handle)
                 batch_offset = 0
@@ -213,15 +285,32 @@ def materialize_parquet_files(
                         customer=customer,
                         sales_date=sales_date,
                     )
-                    enriched_table = pa.Table.from_pandas(frame, preserve_index=False)
+                    target_schema = writer.schema if writer is not None else _schema_for_enriched_frame(
+                        list(frame.columns),
+                        source_schema=source_schema,
+                    )
+                    enriched_table = pa.Table.from_pandas(
+                        frame,
+                        schema=target_schema,
+                        preserve_index=False,
+                        safe=False,
+                    )
                     if writer is None:
                         writer = pq.ParquetWriter(output_path, enriched_table.schema, compression=compression)
                     writer.write_table(enriched_table)
                     total_rows += batch.num_rows
                     batch_offset += batch.num_rows
+            if index == len(parquet_objects) or index % 10 == 0:
+                LOGGER.info(
+                    "Materialization progress: files=%d/%d rows=%d",
+                    index,
+                    len(parquet_objects),
+                    total_rows,
+                )
     finally:
         if writer is not None:
             writer.close()
+    LOGGER.info("Completed materialization to %s rows=%d", output_path, total_rows)
 
     return {
         "output_path": str(output_path),
@@ -308,6 +397,11 @@ def generate_presigned_upload_urls(
     bucket, key_prefix = parse_s3_uri(destination_prefix)
     key_prefix = key_prefix.rstrip("/")
 
+    LOGGER.info(
+        "Generating %d presigned upload URLs for destination prefix %s",
+        len(filenames),
+        destination_prefix,
+    )
     urls: dict[str, str] = {}
     for filename in filenames:
         key = f"{key_prefix}/{filename}"
@@ -326,6 +420,7 @@ def generate_presigned_upload_urls(
 
 def _put_file_via_presigned_url(url: str, local_path: str | Path) -> None:
     local_path = Path(local_path)
+    LOGGER.info("Uploading %s (%d bytes) via presigned URL", local_path.name, local_path.stat().st_size)
     parsed = urlsplit(url)
     request_target = parsed.path or "/"
     if parsed.query:
@@ -353,11 +448,13 @@ def _put_file_via_presigned_url(url: str, local_path: str | Path) -> None:
         if response.status not in {200, 201}:
             body_preview = response_body.decode("utf-8", errors="replace")[:500]
             raise RuntimeError(f"Upload failed for {local_path.name}: HTTP {response.status} {body_preview}")
+        LOGGER.info("Uploaded %s successfully with status %d", local_path.name, response.status)
     finally:
         connection.close()
 
 
 def upload_artifacts_via_presigned_urls(local_paths: dict[str, str], upload_urls: dict[str, str]) -> None:
+    LOGGER.info("Uploading %d artifacts via presigned URLs", len(local_paths))
     for filename, local_path in local_paths.items():
         url = upload_urls[filename]
         _put_file_via_presigned_url(url, local_path)
