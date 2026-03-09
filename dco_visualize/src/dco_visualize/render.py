@@ -770,6 +770,50 @@ def render_standalone_dashboard(
       display: grid;
       gap: 14px;
     }}
+    .filters-panel {{
+      display: grid;
+      gap: 10px;
+      min-height: 0;
+    }}
+    .filters-header {{
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      gap: 10px;
+    }}
+    .filters-header p {{
+      margin: 0;
+      font-size: 11px;
+      font-weight: 700;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      color: rgba(31, 41, 51, 0.5);
+    }}
+    .filters-grid {{
+      display: grid;
+      gap: 10px;
+      max-height: 360px;
+      overflow: auto;
+      padding-right: 4px;
+    }}
+    .filters-grid::-webkit-scrollbar {{
+      width: 8px;
+    }}
+    .filters-grid::-webkit-scrollbar-thumb {{
+      background: rgba(38, 70, 83, 0.18);
+      border-radius: 999px;
+    }}
+    .filter-chip {{
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 6px 10px;
+      border-radius: 999px;
+      background: rgba(38, 70, 83, 0.06);
+      border: 1px solid rgba(38, 70, 83, 0.10);
+      font-size: 12px;
+      line-height: 1.2;
+    }}
     .control-block label {{
       display: block;
       margin-bottom: 8px;
@@ -957,20 +1001,19 @@ def render_standalone_dashboard(
             <select id="color-field"></select>
           </div>
           <div class="control-block">
-            <label for="filter-field">Filter By</label>
-            <select id="filter-field"></select>
-          </div>
-          <div class="control-block">
-            <label for="filter-value">Filter Value</label>
-            <select id="filter-value"></select>
-          </div>
-          <div class="control-block">
             <label>Branch View</label>
             <div class="view-switch" id="branch-view">
               <button type="button" data-mode="compare" class="active">Compare</button>
               <button type="button" data-mode="pretrained">Pretrained</button>
               <button type="button" data-mode="finetuned">Fine-tuned</button>
             </div>
+          </div>
+          <div class="filters-panel">
+            <div class="filters-header">
+              <label style="margin:0; font-size:12px; font-weight:700; letter-spacing:0.08em; text-transform:uppercase; color:rgba(31,41,51,0.6);">Category Filters</label>
+              <p id="filter-count">0 active</p>
+            </div>
+            <div class="filters-grid" id="filters-grid"></div>
           </div>
         </div>
         <div class="sidebar-meta">
@@ -1012,8 +1055,8 @@ def render_standalone_dashboard(
     const colorOptions = embeddingDashboard.color_options;
     const defaultColorKey = embeddingDashboard.default_color_key || (colorOptions[0] && colorOptions[0].key);
     const selectElement = document.getElementById("color-field");
-    const filterFieldElement = document.getElementById("filter-field");
-    const filterValueElement = document.getElementById("filter-value");
+    const filterCountElement = document.getElementById("filter-count");
+    const filtersGridElement = document.getElementById("filters-grid");
     const legendElement = document.getElementById("color-legend");
     const noteElement = document.getElementById("color-note");
     const selectionSummaryElement = document.getElementById("selection-summary");
@@ -1023,8 +1066,9 @@ def render_standalone_dashboard(
     const neutralColor = "#d7d2c8";
     const categoricalPalette = ["#2a9d8f", "#e76f51", "#264653", "#e9c46a", "#457b9d", "#f4a261", "#6d597a", "#43aa8b", "#bc4749", "#577590", "#8ab17d", "#9d4edd"];
     let currentBranchMode = "compare";
-    let currentFilterKey = "__all__";
-    let currentFilterValue = "__all__";
+    const activeFilters = Object.fromEntries(
+      colorOptions.filter((option) => option.kind === "categorical").map((option) => [option.key, "__all__"])
+    );
 
     function fieldLabel(key) {{
       return fieldLabels[key] || key.replace(/_/g, " ");
@@ -1119,22 +1163,28 @@ def render_standalone_dashboard(
       return colors;
     }}
 
-    function indicesForFilter(filterKey, filterValue) {{
-      if (filterKey === "__all__" || filterValue === "__all__") {{
-        return Array.from({{ length: embeddingDashboard.row_count }}, (_, index) => index);
-      }}
-      return columns[filterKey]
-        .map((value, index) => [normalizeCategory(value), index])
-        .filter(([value]) => value === filterValue)
-        .map(([, index]) => index);
-    }}
-
     function filterableOptions() {{
       return colorOptions.filter((option) => option.kind === "categorical");
     }}
 
     function valuesForIndices(values, indices) {{
       return indices.map((index) => values[index]);
+    }}
+
+    function activeFilterEntries() {{
+      return filterableOptions()
+        .map((option) => [option, activeFilters[option.key] || "__all__"])
+        .filter(([, value]) => value !== "__all__");
+    }}
+
+    function indicesForFilters() {{
+      const enabledFilters = activeFilterEntries();
+      if (!enabledFilters.length) {{
+        return Array.from({{ length: embeddingDashboard.row_count }}, (_, index) => index);
+      }}
+      return Array.from({{ length: embeddingDashboard.row_count }}, (_, index) => index).filter((index) =>
+        enabledFilters.every(([option, value]) => normalizeCategory(columns[option.key][index]) === value)
+      );
     }}
 
     function categoricalState(option, indices) {{
@@ -1332,38 +1382,53 @@ def render_standalone_dashboard(
       }};
     }}
 
-    function populateFilterValues(selectedKey) {{
-      filterValueElement.innerHTML = "";
-      const allOption = document.createElement("option");
-      allOption.value = "__all__";
-      allOption.textContent = "All values";
-      filterValueElement.appendChild(allOption);
-      if (selectedKey === "__all__") {{
-        filterValueElement.value = "__all__";
-        return;
-      }}
-      const counts = new Map();
-      columns[selectedKey].map(normalizeCategory).forEach((value) => counts.set(value, (counts.get(value) || 0) + 1));
-      const ordered = semanticOrder(
-        selectedKey,
-        [...counts.entries()].sort((a, b) => b[1] - a[1]).map(([value]) => value),
-      );
-      ordered.forEach((value) => {{
-        const option = document.createElement("option");
-        option.value = value;
-        option.textContent = `${{value === "-1" ? "noise" : value}} · ${{(counts.get(value) || 0).toLocaleString()}}`;
-        filterValueElement.appendChild(option);
+    function populateFilterControls() {{
+      filtersGridElement.innerHTML = "";
+      filterableOptions().forEach((option) => {{
+        const wrapper = document.createElement("div");
+        wrapper.className = "control-block";
+
+        const label = document.createElement("label");
+        label.setAttribute("for", `filter-${{option.key}}`);
+        label.textContent = option.label;
+
+        const select = document.createElement("select");
+        select.id = `filter-${{option.key}}`;
+
+        const allOption = document.createElement("option");
+        allOption.value = "__all__";
+        allOption.textContent = "All values";
+        select.appendChild(allOption);
+
+        const counts = new Map();
+        columns[option.key].map(normalizeCategory).forEach((value) => counts.set(value, (counts.get(value) || 0) + 1));
+        const ordered = semanticOrder(
+          option.key,
+          [...counts.entries()].sort((a, b) => b[1] - a[1]).map(([value]) => value),
+        );
+        ordered.forEach((value) => {{
+          const optionElement = document.createElement("option");
+          optionElement.value = value;
+          optionElement.textContent = `${{value === "-1" ? "noise" : value}} · ${{(counts.get(value) || 0).toLocaleString()}}`;
+          select.appendChild(optionElement);
+        }});
+
+        select.value = activeFilters[option.key] || "__all__";
+        select.addEventListener("change", (event) => {{
+          activeFilters[option.key] = event.target.value;
+          renderOption(selectElement.value);
+        }});
+
+        wrapper.appendChild(label);
+        wrapper.appendChild(select);
+        filtersGridElement.appendChild(wrapper);
       }});
-      if (![...filterValueElement.options].some((option) => option.value === currentFilterValue)) {{
-        currentFilterValue = "__all__";
-      }}
-      filterValueElement.value = currentFilterValue;
     }}
 
     function renderOption(optionKey) {{
       const option = colorOptions.find((entry) => entry.key === optionKey) || colorOptions[0];
       if (!option) return;
-      const indices = indicesForFilter(currentFilterKey, currentFilterValue);
+      const indices = indicesForFilters();
       const state = tracesFor(option, currentBranchMode, indices);
       legendElement.innerHTML = state.legendHtml;
       const branchLabel =
@@ -1372,22 +1437,24 @@ def render_standalone_dashboard(
           : currentBranchMode === "pretrained"
             ? "Pretrained only"
             : "Fine-tuned only";
+      const enabledFilters = activeFilterEntries();
       const filterSummary =
-        currentFilterKey === "__all__" || currentFilterValue === "__all__"
+        !enabledFilters.length
           ? `Showing all ${{indices.length.toLocaleString()}} rows in the dashboard sample.`
-          : `Filtered to ${{fieldLabel(currentFilterKey)}} = ${{currentFilterValue === "-1" ? "noise" : currentFilterValue}} across ${{indices.length.toLocaleString()}} rows.`;
+          : `Filtered to ${{enabledFilters.map(([entry, value]) => `${{entry.label}} = ${{value === "-1" ? "noise" : value}}`).join(" · ")}} across ${{indices.length.toLocaleString()}} rows.`;
       noteElement.textContent = `${{state.note}} ${{filterSummary}}`;
+      filterCountElement.textContent = enabledFilters.length === 1 ? "1 active" : `${{enabledFilters.length}} active`;
+      const activeFilterBadges = enabledFilters.length
+        ? enabledFilters.map(([entry, value]) => `<span class="filter-chip">${{entry.label}} · ${{value === "-1" ? "noise" : value}}</span>`).join("")
+        : `<span class="filter-chip">No category filters</span>`;
       selectionSummaryElement.innerHTML = `
         <p class="summary-title">Current View</p>
         <p class="summary-primary">${{indices.length.toLocaleString()}} rows</p>
         <p class="summary-secondary">
           ${{branchLabel}} · colored by ${{option.label}}
-          ${{
-            currentFilterKey === "__all__" || currentFilterValue === "__all__"
-              ? " · no filter applied."
-              : ` · filtered on ${{fieldLabel(currentFilterKey)}} = ${{currentFilterValue === "-1" ? "noise" : currentFilterValue}}.`
-          }}
+          ${{enabledFilters.length ? " · combined category filters applied." : " · no category filters applied."}}
         </p>
+        <div style="display:flex; flex-wrap:wrap; gap:8px; margin-top:10px;">${{activeFilterBadges}}</div>
       `;
       Plotly.react(plotElement, state.traces, state.layout, {{
         displaylogo: false,
@@ -1401,30 +1468,9 @@ def render_standalone_dashboard(
       optionElement.textContent = option.label;
       selectElement.appendChild(optionElement);
     }});
-    const filterFieldAllOption = document.createElement("option");
-    filterFieldAllOption.value = "__all__";
-    filterFieldAllOption.textContent = "No filter";
-    filterFieldElement.appendChild(filterFieldAllOption);
-    filterableOptions().forEach((option) => {{
-      const optionElement = document.createElement("option");
-      optionElement.value = option.key;
-      optionElement.textContent = option.label;
-      filterFieldElement.appendChild(optionElement);
-    }});
     selectElement.value = defaultColorKey;
     selectElement.addEventListener("change", (event) => renderOption(event.target.value));
-    filterFieldElement.value = currentFilterKey;
-    populateFilterValues(currentFilterKey);
-    filterFieldElement.addEventListener("change", (event) => {{
-      currentFilterKey = event.target.value;
-      currentFilterValue = "__all__";
-      populateFilterValues(currentFilterKey);
-      renderOption(selectElement.value);
-    }});
-    filterValueElement.addEventListener("change", (event) => {{
-      currentFilterValue = event.target.value;
-      renderOption(selectElement.value);
-    }});
+    populateFilterControls();
     branchViewElement.querySelectorAll("button").forEach((button) => {{
       button.addEventListener("click", () => {{
         currentBranchMode = button.dataset.mode;

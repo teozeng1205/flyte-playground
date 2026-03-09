@@ -100,9 +100,11 @@ def test_render_standalone_dashboard_generates_plotly_document(tmp_path: Path) -
     assert "DCO TabPFN 2.5 Dashboard" in html
     assert "Embedding Comparison" in html
     assert "Color By" in html
-    assert "Filter By" in html
+    assert "Category Filters" in html
     assert "Branch View" in html
     assert "Carrier" in html
+    assert "Origin Metro" in html
+    assert "Destination Metro" in html
     assert "dashboard rows" in html
     assert "Row ID" not in html
     assert "Route Network" not in html
