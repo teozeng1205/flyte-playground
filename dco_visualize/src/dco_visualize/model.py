@@ -5,6 +5,7 @@ import logging
 import math
 import os
 import time
+import gc
 from collections import Counter, defaultdict
 from dataclasses import asdict, dataclass
 from datetime import date, datetime
@@ -179,6 +180,16 @@ def _runtime_device() -> str:
     return "cpu"
 
 
+def _attach_feature_names(estimator: Any, X: pd.DataFrame | np.ndarray) -> None:
+    if not isinstance(X, pd.DataFrame):
+        return
+    try:
+        estimator.feature_names_in_ = np.asarray(X.columns, dtype=object)
+        estimator.n_features_in_ = len(X.columns)
+    except Exception:
+        return
+
+
 def ensure_tabpfn_runtime() -> None:
     os.environ.setdefault("TABPFN_DISABLE_TELEMETRY", "1")
     os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
@@ -297,6 +308,7 @@ def _fit_regressor_with_fallback(
         try:
             model = factory(fit_mode, memory_saving_mode)
             model.fit(X_train, y_train)
+            _attach_feature_names(model, X_train)
             if fit_mode != requested_fit_mode:
                 LOGGER.warning(
                     "Using fallback fit mode for %s branch: requested=%s actual=%s memory_saving_mode=%s",
@@ -580,21 +592,52 @@ def _fit_layout(
         projection = ProjectionSpec(name="umap", params={"n_neighbors": 2, "min_dist": config.umap_min_dist})
         return None, coords, projection, 1.0
 
-    n_neighbors = min(config.umap_neighbors, max(2, len(embeddings) - 1))
+    fit_rows = min(len(embeddings), max(3, config.layout_fit_rows))
+    fit_indices = sample_row_indices(len(embeddings), fit_rows, config.random_seed)
+    fit_embeddings = embeddings[fit_indices]
+    n_neighbors = min(config.umap_neighbors, max(2, len(fit_embeddings) - 1))
+    densmap_enabled = fit_rows == len(embeddings)
+    LOGGER.info(
+        "Fitting layout: total_rows=%d fit_rows=%d n_neighbors=%d densmap=%s trust_rows=%d",
+        len(embeddings),
+        fit_rows,
+        n_neighbors,
+        densmap_enabled,
+        min(len(embeddings), max(3, config.trustworthiness_rows)),
+    )
     reducer = umap.UMAP(
         n_components=2,
         metric="cosine",
         n_neighbors=n_neighbors,
         min_dist=config.umap_min_dist,
-        densmap=True,
+        densmap=densmap_enabled,
+        low_memory=True,
         random_state=config.random_seed,
     )
-    coords = reducer.fit_transform(embeddings).astype(np.float32, copy=False)
-    trust_neighbors = max(1, min(10, (len(embeddings) - 1) // 2))
-    score = float(trustworthiness(embeddings, coords, n_neighbors=trust_neighbors))
+    if fit_rows < len(embeddings):
+        fit_coords = reducer.fit_transform(fit_embeddings).astype(np.float32, copy=False)
+        coords = reducer.transform(embeddings).astype(np.float32, copy=False)
+        coords[fit_indices] = fit_coords
+        projection_name = "umap_transform"
+    else:
+        coords = reducer.fit_transform(embeddings).astype(np.float32, copy=False)
+        projection_name = "densmap" if densmap_enabled else "umap"
+
+    trust_rows = min(len(embeddings), max(3, config.trustworthiness_rows))
+    trust_indices = sample_row_indices(len(embeddings), trust_rows, config.random_seed + 1)
+    trust_embeddings = embeddings[trust_indices]
+    trust_coords = coords[trust_indices]
+    trust_neighbors = max(1, min(10, max(1, len(trust_embeddings) // 2 - 1)))
+    score = float(trustworthiness(trust_embeddings, trust_coords, n_neighbors=trust_neighbors))
     projection = ProjectionSpec(
-        name="densmap",
-        params={"n_neighbors": n_neighbors, "min_dist": config.umap_min_dist, "metric": "cosine"},
+        name=projection_name,
+        params={
+            "n_neighbors": n_neighbors,
+            "min_dist": config.umap_min_dist,
+            "metric": "cosine",
+            "fit_rows": fit_rows,
+            "trust_rows": trust_rows,
+        },
     )
     return reducer, coords, projection, score
 
@@ -736,6 +779,7 @@ def _fit_finetuned_branch(
                 TabPFNRegressor,
             )
             eval_regressor.fit(X_train, y_train)
+            _attach_feature_names(eval_regressor, X_train)
 
             try:
                 predictions = eval_regressor.predict(X_val)  # type: ignore[assignment]
@@ -806,6 +850,7 @@ def _fit_finetuned_branch(
                     self.finetuned_inference_regressor_.memory_saving_mode = memory_saving_mode  # type: ignore[attr-defined]
                     self.finetuned_inference_regressor_.n_preprocessing_jobs = config.n_preprocessing_jobs  # type: ignore[attr-defined]
                     self.finetuned_inference_regressor_.fit(self.X_, self.y_)  # type: ignore[arg-type]
+                    _attach_feature_names(self.finetuned_inference_regressor_, self.X_)  # type: ignore[arg-type]
                     _smoke_validate_inference_regressor(
                         self.finetuned_inference_regressor_,
                         self.X_,
@@ -1582,20 +1627,26 @@ def transform_parquet_file(
         pretrained_columns = [column for column in viz_frame.columns if column.startswith("pretrained_emb_")]
         finetuned_columns = [column for column in viz_frame.columns if column.startswith("finetuned_emb_")]
 
+        pretrained_embeddings = viz_frame[pretrained_columns].to_numpy(dtype=np.float32, copy=False)
         pretrained_projector, pretrained_coords, pretrained_projection, pretrained_trust = _fit_layout(
-            viz_frame[pretrained_columns].to_numpy(dtype=np.float32, copy=False),
+            pretrained_embeddings,
             model.config,
         )
+        del pretrained_embeddings
+        gc.collect()
+        finetuned_embeddings = viz_frame[finetuned_columns].to_numpy(dtype=np.float32, copy=False)
         finetuned_projector, finetuned_coords, finetuned_projection, finetuned_trust = _fit_layout(
-            viz_frame[finetuned_columns].to_numpy(dtype=np.float32, copy=False),
+            finetuned_embeddings,
             model.config,
         )
+        del finetuned_embeddings
+        gc.collect()
 
         viz_frame["pretrained_layout_x"] = pretrained_coords[:, 0]
         viz_frame["pretrained_layout_y"] = pretrained_coords[:, 1]
         viz_frame["finetuned_layout_x"] = finetuned_coords[:, 0]
         viz_frame["finetuned_layout_y"] = finetuned_coords[:, 1]
-        viz_frame["layout_method"] = "densmap"
+        viz_frame["layout_method"] = finetuned_projection.name
 
         model.pretrained.projector = pretrained_projector
         model.pretrained.projection = pretrained_projection

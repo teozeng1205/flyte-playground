@@ -52,6 +52,8 @@ class DCOVisualizeConfig:
     hdbscan_min_samples: int = 16
     umap_neighbors: int = 30
     umap_min_dist: float = 0.05
+    layout_fit_rows: int = 10_000
+    trustworthiness_rows: int = 5_000
     progress_log_every_batches: int = 5
     progress_log_every_files: int = 10
     max_hover_columns: int = 12
@@ -113,6 +115,10 @@ class DCOVisualizeConfig:
             raise ValueError("hdbscan_min_samples must be positive")
         if self.umap_neighbors <= 1:
             raise ValueError("umap_neighbors must be greater than 1")
+        if self.layout_fit_rows <= 0:
+            raise ValueError("layout_fit_rows must be positive")
+        if self.trustworthiness_rows <= 0:
+            raise ValueError("trustworthiness_rows must be positive")
         if self.progress_log_every_batches <= 0:
             raise ValueError("progress_log_every_batches must be positive")
         if self.progress_log_every_files <= 0:

@@ -11,6 +11,7 @@ from dco_visualize.model import (
     SegmenterModel,
     TabPFNEmbeddingModel,
     _extract_training_embeddings,
+    _fit_layout,
     _prediction_metrics,
     _winsor_bounds,
     _winsorized_prediction_metrics,
@@ -163,6 +164,57 @@ def test_extract_training_embeddings_falls_back_to_test_source() -> None:
 
     assert source == "test"
     assert embeddings.shape == (6, 3)
+
+
+def test_fit_layout_caps_fit_and_trustworthiness_rows(monkeypatch) -> None:
+    calls: dict[str, int | bool] = {}
+
+    class FakeReducer:
+        def __init__(self, **kwargs) -> None:
+            calls["densmap"] = bool(kwargs["densmap"])
+            calls["low_memory"] = bool(kwargs["low_memory"])
+
+        def fit_transform(self, X: np.ndarray) -> np.ndarray:
+            calls["fit_rows"] = len(X)
+            return np.column_stack(
+                [
+                    np.arange(len(X), dtype=np.float32),
+                    np.arange(len(X), dtype=np.float32) * 0.5,
+                ]
+            )
+
+        def transform(self, X: np.ndarray) -> np.ndarray:
+            calls["transform_rows"] = len(X)
+            return np.column_stack(
+                [
+                    np.arange(len(X), dtype=np.float32),
+                    np.arange(len(X), dtype=np.float32) * 0.25,
+                ]
+            )
+
+    def fake_trustworthiness(X: np.ndarray, Y: np.ndarray, n_neighbors: int) -> float:
+        calls["trust_rows"] = len(X)
+        calls["trust_neighbors"] = n_neighbors
+        return 0.87
+
+    monkeypatch.setattr("dco_visualize.model.umap.UMAP", FakeReducer)
+    monkeypatch.setattr("dco_visualize.model.trustworthiness", fake_trustworthiness)
+
+    config = DCOVisualizeConfig(layout_fit_rows=10, trustworthiness_rows=7)
+    embeddings = np.arange(20 * 3, dtype=np.float32).reshape(20, 3)
+
+    _, coords, projection, score = _fit_layout(embeddings, config)
+
+    assert coords.shape == (20, 2)
+    assert projection.name == "umap_transform"
+    assert projection.params["fit_rows"] == 10
+    assert projection.params["trust_rows"] == 7
+    assert calls["fit_rows"] == 10
+    assert calls["transform_rows"] == 20
+    assert calls["trust_rows"] == 7
+    assert calls["densmap"] is False
+    assert calls["low_memory"] is True
+    assert score == 0.87
 
 
 def test_aggregate_parquet_file_emits_full_day_views(tmp_path) -> None:
