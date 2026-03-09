@@ -99,7 +99,17 @@ def test_render_standalone_dashboard_generates_plotly_document(tmp_path: Path) -
 
     assert "DCO TabPFN 2.5 Dashboard" in html
     assert "Embedding Comparison" in html
-    assert "Representative Sampling" in html
+    assert "Color By" in html
+    assert "Filter By" in html
+    assert "Branch View" in html
+    assert "Carrier" in html
+    assert "dashboard rows" in html
+    assert "Row ID" not in html
+    assert "Route Network" not in html
+    assert "Fare Calendar" not in html
+    assert "Segment Fingerprints" not in html
+    assert "Train Context" not in html
+    assert "Pretrained Trust" not in html
     assert "plotly" in html.lower()
 
 
