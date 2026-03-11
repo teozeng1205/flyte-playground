@@ -13,6 +13,7 @@ from dco_qwen3_visualize.model import (
     run_qwen3_visualization,
     serialize_dco_row,
     serialize_dco_frame,
+    write_training_stats_plot,
 )
 
 
@@ -96,3 +97,40 @@ def test_run_qwen3_visualization_emits_dual_branch_contract(tmp_path: Path, monk
     assert result["metrics"]["pair_count"] >= 0
     assert Path(result["finetune_pairs_path"]).exists()
     assert Path(result["adapter_tar_path"]).exists()
+
+
+def test_write_training_stats_plot_renders(tmp_path: Path) -> None:
+    output_path = tmp_path / "training_stats.png"
+    metrics = {
+        "model_id": "Qwen/Qwen3-Embedding-0.6B",
+        "train_rows": 50_000,
+        "viz_rows": 50_000,
+        "pair_count": 19_677,
+        "elapsed_seconds": 321.0,
+        "pretrained": {
+            "embedding_dim": 512,
+            "projection_trustworthiness": 0.91,
+            "price_neighbor_correlation": 0.42,
+            "segment_count": 8,
+        },
+        "finetuned": {
+            "embedding_dim": 512,
+            "projection_trustworthiness": 0.96,
+            "price_neighbor_correlation": 0.68,
+            "segment_count": 10,
+            "finetune": {
+                "status": "succeeded",
+                "steps": 120,
+                "mean_loss": 0.41,
+                "final_loss": 0.19,
+                "epoch_mean_losses": [0.62, 0.35, 0.21],
+                "sampled_loss_steps": [1, 20, 40, 60, 80, 100, 120],
+                "sampled_loss_values": [0.9, 0.8, 0.65, 0.48, 0.35, 0.24, 0.19],
+            },
+        },
+    }
+
+    write_training_stats_plot(output_path, metrics)
+
+    assert output_path.exists()
+    assert output_path.stat().st_size > 0

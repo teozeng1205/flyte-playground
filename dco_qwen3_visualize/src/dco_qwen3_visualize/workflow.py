@@ -143,9 +143,9 @@ def fit_qwen3_artifacts(
     viz_rows: int,
     output_prefix: str,
     batch_size: int,
-) -> tuple[File, File, File, File, File, File]:
+) -> tuple[File, File, File, File, File, File, File]:
     from dco_qwen3_visualize.io import write_json
-    from dco_qwen3_visualize.model import run_qwen3_visualization
+    from dco_qwen3_visualize.model import run_qwen3_visualization, write_training_stats_plot
 
     _configure_logging()
     config = DCOQwen3VisualizeConfig(
@@ -174,10 +174,12 @@ def fit_qwen3_artifacts(
     viz_path = tmpdir / "viz_sample.parquet"
     pretrained_path = tmpdir / "pretrained_embeddings.parquet"
     finetuned_path = tmpdir / "finetuned_embeddings.parquet"
+    training_stats_path = tmpdir / "training_stats.png"
     metrics_path = tmpdir / "metrics.json"
     result["viz_frame"].to_parquet(viz_path, index=False)
     result["pretrained_frame"].to_parquet(pretrained_path, index=False)
     result["finetuned_frame"].to_parquet(finetuned_path, index=False)
+    write_training_stats_plot(training_stats_path, result["metrics"])
     write_json(metrics_path, result["metrics"])
     LOGGER.info(
         "Completed fit_qwen3_artifacts: viz_rows=%d elapsed=%.2fs",
@@ -190,6 +192,7 @@ def fit_qwen3_artifacts(
         File.from_local_sync(str(finetuned_path)),
         File.from_local_sync(str(result["finetune_pairs_path"])),
         File.from_local_sync(str(result["adapter_tar_path"])),
+        File.from_local_sync(str(training_stats_path)),
         File.from_local_sync(str(metrics_path)),
     )
 
@@ -205,6 +208,7 @@ def render_artifacts(
     finetuned_embeddings_file: File,
     finetune_pairs_file: File,
     adapter_tar_file: File,
+    training_stats_file: File,
     metrics_file: File,
     customer: str,
     sales_date: str,
@@ -247,6 +251,7 @@ def render_artifacts(
     finetuned_path = finetuned_embeddings_file.download_sync()
     finetune_pairs_path = finetune_pairs_file.download_sync()
     adapter_path = adapter_tar_file.download_sync()
+    training_stats_path = training_stats_file.download_sync()
     metrics_path = metrics_file.download_sync()
 
     profile = read_json(profile_path)
@@ -281,6 +286,7 @@ def render_artifacts(
         "finetuned_embeddings": artifact_uri(destination_prefix, "finetuned_embeddings.parquet"),
         "finetune_pairs": artifact_uri(destination_prefix, "finetune_pairs.jsonl"),
         "finetuned_adapter": artifact_uri(destination_prefix, "finetuned_adapter.tar.gz"),
+        "training_stats": artifact_uri(destination_prefix, "training_stats.png"),
         "metrics": artifact_uri(destination_prefix, "metrics.json"),
         "dashboard": artifact_uri(destination_prefix, "dashboard.html"),
         "manifest": artifact_uri(destination_prefix, "manifest.json"),
@@ -310,6 +316,7 @@ def render_artifacts(
         "finetuned_embeddings.parquet": finetuned_path,
         "finetune_pairs.jsonl": finetune_pairs_path,
         "finetuned_adapter.tar.gz": adapter_path,
+        "training_stats.png": training_stats_path,
         "metrics.json": metrics_path,
         "dashboard.html": str(html_path),
         "manifest.json": str(manifest_path),
@@ -321,6 +328,7 @@ def render_artifacts(
         "viz_sample_uri": uploads["viz_sample"],
         "pretrained_embeddings_uri": uploads["pretrained_embeddings"],
         "finetuned_embeddings_uri": uploads["finetuned_embeddings"],
+        "training_stats_uri": uploads["training_stats"],
     }
 
 
@@ -375,7 +383,15 @@ def execute(
             batch_size=batch_size,
         )
 
-    viz_sample_file, pretrained_embeddings_file, finetuned_embeddings_file, finetune_pairs_file, adapter_tar_file, metrics_file = fit_qwen3_artifacts(
+    (
+        viz_sample_file,
+        pretrained_embeddings_file,
+        finetuned_embeddings_file,
+        finetune_pairs_file,
+        adapter_tar_file,
+        training_stats_file,
+        metrics_file,
+    ) = fit_qwen3_artifacts(
         context_sample_file=context_sample_file,
         eval_sample_file=eval_sample_file,
         customer=customer,
@@ -399,6 +415,7 @@ def execute(
         finetuned_embeddings_file=finetuned_embeddings_file,
         finetune_pairs_file=finetune_pairs_file,
         adapter_tar_file=adapter_tar_file,
+        training_stats_file=training_stats_file,
         metrics_file=metrics_file,
         customer=customer,
         sales_date=sales_date,

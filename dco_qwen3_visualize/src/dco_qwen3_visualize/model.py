@@ -96,7 +96,7 @@ class QwenEmbeddingEncoder:
                     device=self.device,
                     normalize=True,
                 )
-            arrays.append(embeddings.cpu().numpy())
+            arrays.append(embeddings.float().cpu().numpy())
             if offset == 0 or offset + effective_batch_size >= len(texts) or ((offset // effective_batch_size) + 1) % self.config.progress_log_every_batches == 0:
                 snapshot = progress_snapshot(min(offset + len(batch), len(texts)), len(texts), started_at)
                 LOGGER.info(
@@ -112,6 +112,17 @@ class QwenEmbeddingEncoder:
         if not arrays:
             return np.zeros((0, self.config.embedding_dim), dtype=np.float32)
         return np.concatenate(arrays, axis=0)
+
+
+def _matplotlib_pyplot():
+    import matplotlib
+    import tempfile
+
+    os.environ.setdefault("MPLCONFIGDIR", tempfile.mkdtemp(prefix="mplconfig_"))
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    return plt
 
 
 def _device_string() -> str:
@@ -364,7 +375,7 @@ def _load_qwen_encoder(
     dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
     model_kwargs = {
         "trust_remote_code": True,
-        "torch_dtype": dtype,
+        "dtype": dtype,
     }
     try:
         model = AutoModel.from_pretrained(config.model_id, attn_implementation="flash_attention_2", **model_kwargs)
@@ -449,10 +460,12 @@ def _fine_tune_qwen3_adapter(
     device = base_encoder.device
     batch_size = config.finetune_batch_size
     losses: list[float] = []
+    epoch_mean_losses: list[float] = []
     global_step = 0
 
     for epoch in range(config.finetune_epochs):
         epoch_records = pair_records[: min(len(pair_records), config.finetune_max_steps_per_epoch * batch_size)]
+        epoch_losses: list[float] = []
         for batch_start in range(0, len(epoch_records), batch_size):
             batch_records = epoch_records[batch_start : batch_start + batch_size]
             anchors = [str(record["anchor_text"]) for record in batch_records]
@@ -498,6 +511,7 @@ def _fine_tune_qwen3_adapter(
                 optimizer.zero_grad(set_to_none=True)
 
             losses.append(float(loss.detach().cpu().item()))
+            epoch_losses.append(losses[-1])
             global_step += 1
             if global_step <= 2 or global_step % config.progress_log_every_batches == 0:
                 LOGGER.info(
@@ -507,9 +521,16 @@ def _fine_tune_qwen3_adapter(
                     losses[-1],
                     format_duration(time.perf_counter() - started_at),
                 )
+        epoch_mean_losses.append(float(np.mean(epoch_losses)) if epoch_losses else float("nan"))
 
     model.save_pretrained(output_dir)
     base_encoder.tokenizer.save_pretrained(output_dir)
+    stride = max(1, len(losses) // 200) if losses else 1
+    sampled_steps = list(range(1, len(losses) + 1, stride))
+    sampled_losses = losses[::stride]
+    if losses and sampled_steps[-1] != len(losses):
+        sampled_steps.append(len(losses))
+        sampled_losses.append(losses[-1])
     metrics = {
         "status": "succeeded",
         "epochs": config.finetune_epochs,
@@ -517,6 +538,9 @@ def _fine_tune_qwen3_adapter(
         "pairs": len(pair_records),
         "mean_loss": float(np.mean(losses)) if losses else None,
         "final_loss": losses[-1] if losses else None,
+        "epoch_mean_losses": epoch_mean_losses,
+        "sampled_loss_steps": sampled_steps,
+        "sampled_loss_values": sampled_losses,
         "elapsed_seconds": time.perf_counter() - started_at,
     }
     write_json(output_dir / "adapter_metrics.json", metrics)
@@ -635,6 +659,101 @@ def _build_viz_frame(
     viz_frame["finetuned_segment_id"] = finetuned_segments
     viz_frame["layout_method"] = pretrained_layout.method
     return viz_frame
+
+
+def write_training_stats_plot(path: str | Path, metrics: dict[str, object]) -> None:
+    plt = _matplotlib_pyplot()
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    pretrained = dict(metrics.get("pretrained", {}))
+    finetuned = dict(metrics.get("finetuned", {}))
+    finetune = dict(finetuned.get("finetune", {}))
+
+    branch_labels = ["Pretrained", "Fine-tuned"]
+    trust_scores = [
+        float(pretrained.get("projection_trustworthiness") or 0.0),
+        float(finetuned.get("projection_trustworthiness") or 0.0),
+    ]
+    neighbor_scores = [
+        float(pretrained.get("price_neighbor_correlation") or 0.0),
+        float(finetuned.get("price_neighbor_correlation") or 0.0),
+    ]
+    segment_counts = [
+        float(pretrained.get("segment_count") or 0.0),
+        float(finetuned.get("segment_count") or 0.0),
+    ]
+
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+    fig.patch.set_facecolor("#f4f0e8")
+    x = np.arange(len(branch_labels))
+
+    axes[0, 0].bar(x, trust_scores, color=["#4c7b6d", "#e28743"], width=0.6)
+    axes[0, 0].set_xticks(x, branch_labels)
+    axes[0, 0].set_ylim(0.0, max(1.0, max(trust_scores) * 1.1))
+    axes[0, 0].set_title("Projection Trustworthiness")
+    axes[0, 0].set_ylabel("Trustworthiness")
+    axes[0, 0].grid(axis="y", alpha=0.25)
+
+    axes[0, 1].bar(x - 0.18, neighbor_scores, width=0.35, color="#4477aa", label="Price Neighbor Corr.")
+    axes[0, 1].bar(x + 0.18, segment_counts, width=0.35, color="#cc6677", label="Segment Count")
+    axes[0, 1].set_xticks(x, branch_labels)
+    axes[0, 1].set_title("Embedding Quality Signals")
+    axes[0, 1].grid(axis="y", alpha=0.25)
+    axes[0, 1].legend(frameon=False, fontsize=8)
+
+    sampled_steps = [int(step) for step in finetune.get("sampled_loss_steps", [])]
+    sampled_losses = [float(value) for value in finetune.get("sampled_loss_values", [])]
+    epoch_mean_losses = [float(value) for value in finetune.get("epoch_mean_losses", []) if value == value]
+    if sampled_steps and sampled_losses:
+        axes[1, 0].plot(sampled_steps, sampled_losses, color="#7b5ea7", linewidth=2, label="Sampled step loss")
+    if epoch_mean_losses:
+        epoch_x = np.linspace(
+            sampled_steps[0] if sampled_steps else 1,
+            sampled_steps[-1] if sampled_steps else max(1, len(epoch_mean_losses)),
+            num=len(epoch_mean_losses),
+        )
+        axes[1, 0].plot(epoch_x, epoch_mean_losses, color="#2a9d8f", linewidth=2, linestyle="--", label="Epoch mean loss")
+    axes[1, 0].set_title("LoRA Fine-tuning Loss")
+    axes[1, 0].set_xlabel("Training step")
+    axes[1, 0].set_ylabel("InfoNCE loss")
+    axes[1, 0].grid(alpha=0.25)
+    if sampled_steps or epoch_mean_losses:
+        axes[1, 0].legend(frameon=False, fontsize=8)
+    else:
+        axes[1, 0].text(0.5, 0.5, "No fine-tune loss history available", ha="center", va="center", transform=axes[1, 0].transAxes)
+        axes[1, 0].set_axis_off()
+
+    summary_lines = [
+        f"Model: {metrics.get('model_id', 'unknown')}",
+        f"Train rows: {metrics.get('train_rows', 'unknown')}",
+        f"Viz rows: {metrics.get('viz_rows', 'unknown')}",
+        f"Pairs: {metrics.get('pair_count', 'unknown')}",
+        f"Embedding dim: {pretrained.get('embedding_dim', 'unknown')}",
+        f"Fine-tune status: {finetune.get('status', 'unknown')}",
+        f"Fine-tune steps: {finetune.get('steps', 'unknown')}",
+        f"Mean loss: {finetune.get('mean_loss', 'unknown')}",
+        f"Final loss: {finetune.get('final_loss', 'unknown')}",
+        f"Elapsed: {format_duration(float(metrics.get('elapsed_seconds', 0.0) or 0.0))}",
+    ]
+    axes[1, 1].axis("off")
+    axes[1, 1].text(
+        0.02,
+        0.98,
+        "\n".join(summary_lines),
+        va="top",
+        ha="left",
+        fontsize=10,
+        family="monospace",
+        bbox={"boxstyle": "round,pad=0.5", "facecolor": "white", "edgecolor": "#d6c9b8"},
+        transform=axes[1, 1].transAxes,
+    )
+    axes[1, 1].set_title("Run Summary")
+
+    fig.suptitle("Qwen3 DCO Training Stats", fontsize=16, fontweight="bold")
+    fig.tight_layout(rect=(0, 0, 1, 0.97))
+    fig.savefig(path, dpi=180, bbox_inches="tight")
+    plt.close(fig)
 
 
 def run_qwen3_visualization(

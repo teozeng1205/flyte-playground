@@ -10,6 +10,7 @@ dependencies = [
     "flyte==2.0.2",
     "fsspec>=2025.2.0",
     "huggingface-hub>=0.34.4",
+    "matplotlib>=3.10.0",
     "numpy>=2.2.0",
     "pandas>=2.2.0",
     "peft>=0.17.1",
